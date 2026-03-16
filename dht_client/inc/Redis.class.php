@@ -2,11 +2,11 @@
 
 class RedisPool
 {
-    private static $instance;
+    private static $instances = [];
     private $config = [];
     private $pool;
     private $max_connections = 10;
-    private $current_connections = 0;
+    private $current_connections;
     private $ping_interval = 30;
 
     private function __construct()
@@ -15,10 +15,12 @@ class RedisPool
 
     public static function getInstance()
     {
-        if (!self::$instance) {
-            self::$instance = new self();
+        // 使用进程ID作为键，确保每个Worker进程都有独立的实例
+        $pid = getmypid();
+        if (!isset(self::$instances[$pid])) {
+            self::$instances[$pid] = new self();
         }
-        return self::$instance;
+        return self::$instances[$pid];
     }
 
     public function init($config = [])
@@ -29,8 +31,11 @@ class RedisPool
             $this->max_connections = min($config['max_connections'], 50);
         }
 
-        // 增加Channel容量，确保能容纳所有连接
-        $this->pool = new Swoole\Coroutine\Channel($this->max_connections + 10);
+        // 初始化原子计数器
+        $this->current_connections = new Swoole\Atomic(0);
+
+        // 连接池容量设置为最大连接数
+        $this->pool = new Swoole\Coroutine\Channel($this->max_connections);
 
         return $this;
     }
@@ -64,8 +69,6 @@ class RedisPool
             if (defined('Redis::OPT_CONNECT_TIMEOUT')) {
                 $redis->setOption(Redis::OPT_CONNECT_TIMEOUT, $timeout);
             }
-
-            $this->current_connections++;
 
             return [
                 'redis' => $redis,
@@ -111,27 +114,28 @@ class RedisPool
         while ($attempts < $max_attempts) {
             $attempts++;
             
-            if (!$this->pool->isEmpty()) {
-                $conn = $this->pool->pop(0.1); // 100ms超时
-                if ($conn) {
-                    if ($this->isConnectionValid($conn)) {
-                        return $conn['redis'];
-                    }
-
-                    try {
-                        $conn['redis']->close();
-                    } catch (Exception $e) {}
-
-                    $this->current_connections--;
+            // 直接从池中获取连接，处理空队列情况
+            $conn = $this->pool->pop(0.1); // 100ms超时
+            if ($conn) {
+                if ($this->isConnectionValid($conn)) {
+                    return $conn['redis'];
                 }
+
+                try {
+                    $conn['redis']->close();
+                } catch (Exception $e) {}
+
+                $this->current_connections->sub(1);
             }
 
-            // 检查是否可以创建新连接
-            if ($this->current_connections < $this->max_connections) {
+            // 检查是否可以创建新连接，使用原子操作避免并发问题
+            if ($this->current_connections->add(1) <= $this->max_connections) {
                 $conn = $this->createConnection();
                 if ($conn) {
                     return $conn['redis'];
                 }
+                // 创建连接失败，减少计数
+                $this->current_connections->sub(1);
             }
 
             // 短暂挂起，避免忙等
@@ -159,7 +163,7 @@ class RedisPool
                 $redis->close();
             } catch (Exception $e) {}
 
-            $this->current_connections--;
+            $this->current_connections->sub(1);
         }
     }
 
@@ -171,34 +175,45 @@ class RedisPool
 
         while ($retry < $max_retries) {
 
-            $redis = $this->getConnection();
-
-            if (!$redis) {
-                $retry++;
-                Swoole\Coroutine::sleep(0.01);
-                continue;
-            }
+            $redis = null;
 
             try {
 
-                return $callback($redis);
+                $redis = $this->getConnection();
 
-            } catch (Exception $e) {
+                if (!$redis) {
+                    $retry++;
+                    Swoole\Coroutine::sleep(0.01);
+                    continue;
+                }
 
-                try {
-                    $redis->close();
-                } catch (Exception $e) {}
+                $result = $callback($redis);
 
-                $this->current_connections--;
+                return $result;
+
+            } catch (Throwable $e) {
+
+                if ($redis) {
+                    try {
+                        $redis->close();
+                    } catch (Exception $e) {}
+
+                    $this->current_connections->sub(1);
+                    $redis = null;
+                }
+
                 $retry++;
                 Swoole\Coroutine::sleep(0.01);
                 continue;
 
             } finally {
 
-                $this->returnConnection($redis);
+                if ($redis) {
+                    $this->returnConnection($redis);
+                }
 
             }
+
         }
 
         return false;
@@ -228,10 +243,6 @@ class RedisPool
             $infohash_bin = $this->normalizeInfohash($infohash);
 
             $set_key = $this->config['prefix'] . 'infohashes';
-
-            if ($redis->sIsMember($set_key, $infohash_bin)) {
-                return false;
-            }
 
             $result = $redis->sAdd($set_key, $infohash_bin);
 
@@ -271,6 +282,18 @@ class RedisPool
             }
         }
 
-        $this->current_connections = 0;
+        $this->current_connections->set(0);
+    }
+
+    /**
+     * 析构函数，确保连接被正确清理
+     */
+    public function __destruct()
+    {
+        try {
+            $this->closeAll();
+        } catch (Throwable $e) {
+            // 捕获异常，避免影响进程退出
+        }
     }
 }

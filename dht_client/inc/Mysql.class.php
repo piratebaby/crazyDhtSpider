@@ -4,11 +4,11 @@
  */
 class MysqlPool
 {
-    private static $instance;
+    private static $instances = [];
     private $config = array();
     private $pool = array();
     private $max_connections = 10;
-    private $current_connections = 0;
+    private $current_connections;
     
     /**
      * 私有构造方法，防止直接实例化
@@ -21,10 +21,12 @@ class MysqlPool
      */
     public static function getInstance()
     {
-        if (!self::$instance) {
-            self::$instance = new self();
+        // 使用进程ID作为键，确保每个Worker进程都有独立的实例
+        $pid = getmypid();
+        if (!isset(self::$instances[$pid])) {
+            self::$instances[$pid] = new self();
         }
-        return self::$instance;
+        return self::$instances[$pid];
     }
     
     /**
@@ -36,6 +38,8 @@ class MysqlPool
     {
         $this->config = $config;
         $this->max_connections = isset($config['max_connections']) ? $config['max_connections'] : 10;
+        // 初始化原子计数器
+        $this->current_connections = new Swoole\Atomic(0);
         return $this;
     }
     
@@ -54,49 +58,54 @@ class MysqlPool
             } else {
                 // 连接无效，关闭并减少计数
                 $conn->close();
-                $this->current_connections--;
+                $this->current_connections->sub(1);
             }
         }
         
-        // 检查是否达到最大连接数
-        if ($this->current_connections >= $this->max_connections) {
-            error_log('MySQL connection pool exhausted. Current: ' . $this->current_connections . ', Max: ' . $this->max_connections);
-            return null;
-        }
-        
-        // 连接重试机制
-        $retryCount = 0;
-        $maxRetries = 3;
-        $retryDelay = 100000; // 100毫秒
-        
-        while ($retryCount < $maxRetries) {
-            try {
-                $conn = new mysqli();
-                $conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, $this->config['timeout'] ?? 2);
-                $conn->connect(
-                    $this->config['host'],
-                    $this->config['user'],
-                    $this->config['password'],
-                    $this->config['database'],
-                    $this->config['port'] ?? 3306
-                );
-                
-                if ($conn->connect_error) {
-                    throw new Exception('MySQL connection error: ' . $conn->connect_error);
+        // 检查是否达到最大连接数，使用原子操作避免并发问题
+        if ($this->current_connections->add(1) <= $this->max_connections) {
+            // 连接重试机制
+            $retryCount = 0;
+            $maxRetries = 3;
+            $retryDelay = 100000; // 100毫秒
+            
+            while ($retryCount < $maxRetries) {
+                try {
+                    $conn = new mysqli();
+                    $conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, $this->config['timeout'] ?? 2);
+                    $conn->connect(
+                        $this->config['host'],
+                        $this->config['user'],
+                        $this->config['password'],
+                        $this->config['database'],
+                        $this->config['port'] ?? 3306
+                    );
+                    
+                    if ($conn->connect_error) {
+                        throw new Exception('MySQL connection error: ' . $conn->connect_error);
+                    }
+                    
+                    $conn->set_charset($this->config['charset'] ?? 'utf8mb4');
+                    return $conn;
+                } catch (Exception $e) {
+                    $retryCount++;
+                    if ($retryCount >= $maxRetries) {
+                        error_log('MySQL connection error after ' . $maxRetries . ' retries: ' . $e->getMessage());
+                        // 创建连接失败，减少计数
+                        $this->current_connections->sub(1);
+                        return null;
+                    }
+                    error_log('MySQL connection attempt ' . $retryCount . ' failed, retrying in ' . ($retryDelay / 1000) . 'ms: ' . $e->getMessage());
+                    usleep($retryDelay);
                 }
-                
-                $conn->set_charset($this->config['charset'] ?? 'utf8mb4');
-                $this->current_connections++;
-                return $conn;
-            } catch (Exception $e) {
-                $retryCount++;
-                if ($retryCount >= $maxRetries) {
-                    error_log('MySQL connection error after ' . $maxRetries . ' retries: ' . $e->getMessage());
-                    return null;
-                }
-                error_log('MySQL connection attempt ' . $retryCount . ' failed, retrying in ' . ($retryDelay / 1000) . 'ms: ' . $e->getMessage());
-                usleep($retryDelay);
             }
+            
+            // 所有重试都失败，减少计数
+            $this->current_connections->sub(1);
+        } else {
+            // 连接数达到上限，减少计数
+            $this->current_connections->sub(1);
+            error_log('MySQL connection pool exhausted. Current: ' . $this->current_connections->get() . ', Max: ' . $this->max_connections);
         }
         
         return null;
@@ -124,7 +133,19 @@ class MysqlPool
             }
         }
         $this->pool = array();
-        $this->current_connections = 0;
+        $this->current_connections->set(0);
+    }
+
+    /**
+     * 析构函数，确保连接被正确清理
+     */
+    public function __destruct()
+    {
+        try {
+            $this->closeAll();
+        } catch (Throwable $e) {
+            // 捕获异常，避免影响进程退出
+        }
     }
     
     /**

@@ -904,6 +904,20 @@ class MySwoole
             // 清理所有定时器，确保进程能快速退出
             swoole_timer_clear_all();
 
+            // 清理Redis连接池
+            try {
+                RedisPool::getInstance()->closeAll();
+            } catch (Throwable $e) {
+                // 捕获异常，避免影响进程退出
+            }
+
+            // 清理MySQL连接池
+            try {
+                MysqlPool::getInstance()->closeAll();
+            } catch (Throwable $e) {
+                // 捕获异常，避免影响进程退出
+            }
+
             // 释放全局变量资源
             if (function_exists('gc_mem_caches')) {
                 gc_mem_caches();
