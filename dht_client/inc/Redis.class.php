@@ -6,16 +6,13 @@ class RedisPool
     private $config = [];
     private $pool;
     private $max_connections = 10;
-    private $current_connections;
+    private $current_count = 0; // 替换 Atomic，Worker 内协程安全
     private $ping_interval = 30;
 
-    private function __construct()
-    {
-    }
+    private function __construct() {}
 
     public static function getInstance()
     {
-        // 使用进程ID作为键，确保每个Worker进程都有独立的实例
         $pid = getmypid();
         if (!isset(self::$instances[$pid])) {
             self::$instances[$pid] = new self();
@@ -26,33 +23,31 @@ class RedisPool
     public function init($config = [])
     {
         $this->config = $config;
-
         if (!empty($config['max_connections'])) {
-            $this->max_connections = min($config['max_connections'], 50);
+            $this->max_connections = (int)$config['max_connections'];
         }
 
-        // 初始化原子计数器
-        $this->current_connections = new Swoole\Atomic(0);
-
-        // 连接池容量设置为最大连接数
+        // 使用 Channel 作为协程池容器
         $this->pool = new Swoole\Coroutine\Channel($this->max_connections);
-
         return $this;
     }
 
     private function createConnection()
     {
         try {
-
-            $redis = new Redis();
-
+            $redis = new \Redis();
             $timeout = $this->config['timeout'] ?? 3;
 
-            $redis->connect(
+            // 1. 建立连接并检查布尔返回值
+            $connected = $redis->connect(
                 $this->config['host'],
                 $this->config['port'],
                 $timeout
             );
+
+            if (!$connected) {
+                return null;
+            }
 
             if (!empty($this->config['password'])) {
                 $redis->auth($this->config['password']);
@@ -62,238 +57,117 @@ class RedisPool
                 $redis->select($this->config['database']);
             }
 
-            // 设置连接选项
-            if (defined('Redis::OPT_READ_TIMEOUT')) {
-                $redis->setOption(Redis::OPT_READ_TIMEOUT, 3);
-            }
-            if (defined('Redis::OPT_CONNECT_TIMEOUT')) {
-                $redis->setOption(Redis::OPT_CONNECT_TIMEOUT, $timeout);
+            // 2. 【关键】开启异常模式，确保网络错误能被 execute() 的 catch 捕获
+            $redis->setOption(\Redis::OPT_SERIALIZER, \Redis::SERIALIZER_NONE);
+            $redis->setOption(\Redis::OPT_READ_TIMEOUT, 3);
+            if (defined('\Redis::OPT_EXCEPTION')) {
+                $redis->setOption(\Redis::OPT_EXCEPTION, true);
             }
 
             return [
                 'redis' => $redis,
                 'time' => time()
             ];
-
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             return null;
-        }
-    }
-
-    private function isConnectionValid($conn)
-    {
-        $redis = $conn['redis'];
-        $last_used = $conn['time'];
-
-        if (time() - $last_used < $this->ping_interval) {
-            return true;
-        }
-
-        try {
-
-            $result = $redis->ping();
-
-            return $result === '+PONG' || $result === true;
-
-        } catch (Exception $e) {
-            return false;
         }
     }
 
     public function getConnection()
     {
-
-        if (empty($this->config['host'])) {
-            return null;
-        }
-
-        // 尝试从池中获取连接
-        $attempts = 0;
-        $max_attempts = 5;
-        
-        while ($attempts < $max_attempts) {
-            $attempts++;
+        // 1. 尝试从池中获取
+        $conn = $this->pool->pop(0.5); // 稍微加长等待时间，减少忙等
+        if ($conn) {
+            // 检查连接是否可用
+            if (time() - $conn['time'] < $this->ping_interval) {
+                return $conn['redis'];
+            }
             
-            // 直接从池中获取连接，处理空队列情况
-            $conn = $this->pool->pop(0.1); // 100ms超时
-            if ($conn) {
-                if ($this->isConnectionValid($conn)) {
+            // 超过心跳时间，测试一次 PING
+            try {
+                if ($conn['redis']->ping()) {
                     return $conn['redis'];
                 }
-
-                try {
-                    $conn['redis']->close();
-                } catch (Exception $e) {}
-
-                $this->current_connections->sub(1);
+            } catch (\Throwable $e) {
+                // PING 失败，销毁连接
             }
-
-            // 检查是否可以创建新连接，使用原子操作避免并发问题
-            if ($this->current_connections->add(1) <= $this->max_connections) {
-                $conn = $this->createConnection();
-                if ($conn) {
-                    return $conn['redis'];
-                }
-                // 创建连接失败，减少计数
-                $this->current_connections->sub(1);
-            }
-
-            // 短暂挂起，避免忙等
-            Swoole\Coroutine::sleep(0.01);
+            
+            $this->destroyConnection($conn['redis']);
         }
 
-        return null;
+        // 2. 尝试创建新连接（严格控制计数器）
+        if ($this->current_count < $this->max_connections) {
+            $this->current_count++; // 先占位
+            $newConn = $this->createConnection();
+            if ($newConn) {
+                return $newConn['redis'];
+            }
+            $this->current_count--; // 创建失败，归还位子
+        }
+
+        // 3. 最后尝试再次从池中阻塞获取（兜底）
+        $conn = $this->pool->pop(1.0);
+        return $conn ? $conn['redis'] : null;
     }
 
     public function returnConnection($redis)
     {
-        if (!$redis instanceof Redis) {
+        if (!$redis instanceof \Redis) {
             return;
         }
 
-        $conn = [
-            'redis' => $redis,
-            'time' => time()
-        ];
+        // 如果池子没满，放回去；满了则销毁
+        $data = ['redis' => $redis, 'time' => time()];
+        if (!$this->pool->push($data, 0.001)) {
+            $this->destroyConnection($redis);
+        }
+    }
 
-        // 使用非阻塞的push操作，如果失败则关闭连接
-        if (!$this->pool->push($conn, 0.1)) {
-
-            try {
-                $redis->close();
-            } catch (Exception $e) {}
-
-            $this->current_connections->sub(1);
+    private function destroyConnection($redis)
+    {
+        try {
+            $redis->close();
+        } catch (\Throwable $e) {
+        } finally {
+            $this->current_count--;
+            if ($this->current_count < 0) $this->current_count = 0;
         }
     }
 
     public function execute(callable $callback)
     {
-
-        $retry = 0;
-        $max_retries = 3;
-
-        while ($retry < $max_retries) {
-
-            $redis = null;
-
-            try {
-
-                $redis = $this->getConnection();
-
-                if (!$redis) {
-                    $retry++;
-                    Swoole\Coroutine::sleep(0.01);
-                    continue;
-                }
-
-                $result = $callback($redis);
-
-                return $result;
-
-            } catch (Throwable $e) {
-
-                if ($redis) {
-                    try {
-                        $redis->close();
-                    } catch (Exception $e) {}
-
-                    $this->current_connections->sub(1);
-                    $redis = null;
-                }
-
-                $retry++;
-                Swoole\Coroutine::sleep(0.01);
-                continue;
-
-            } finally {
-
-                if ($redis) {
-                    $this->returnConnection($redis);
-                }
-
-            }
-
+        $redis = $this->getConnection();
+        if (!$redis) {
+            return false;
         }
 
-        return false;
+        try {
+            $result = $callback($redis);
+            $this->returnConnection($redis); // 正常逻辑，还回池子
+            return $result;
+        } catch (\Throwable $e) {
+            // 只要报错（网络超时、断开等），一律销毁，不传毒
+            $this->destroyConnection($redis);
+            return false;
+        }
     }
+
+    // --- 业务方法 ---
 
     public function exists($infohash)
     {
-
-        $result = $this->execute(function($redis) use ($infohash) {
-
+        return $this->execute(function($redis) use ($infohash) {
             $infohash_bin = $this->normalizeInfohash($infohash);
-
-            $set_key = $this->config['prefix'] . 'infohashes';
-
+            $set_key = ($this->config['prefix'] ?? '') . 'infohashes';
             return (bool)$redis->sIsMember($set_key, $infohash_bin);
-
-        });
-
-        return (bool)$result;
-    }
-
-    public function set($infohash, $expire = 86400)
-    {
-
-        return (bool)$this->execute(function($redis) use ($infohash, $expire) {
-
-            $infohash_bin = $this->normalizeInfohash($infohash);
-
-            $set_key = $this->config['prefix'] . 'infohashes';
-
-            $result = $redis->sAdd($set_key, $infohash_bin);
-
-            if ($result) {
-                $redis->expire($set_key, $expire);
-            }
-
-            return $result;
-
         });
     }
 
     private function normalizeInfohash($infohash)
     {
-
         if (strlen($infohash) === 40 && ctype_xdigit($infohash)) {
             return hex2bin($infohash);
         }
-
-        if (strlen($infohash) === 20) {
-            return $infohash;
-        }
-
-        return hex2bin(strtoupper(bin2hex($infohash)));
-    }
-
-    public function closeAll()
-    {
-
-        while (!$this->pool->isEmpty()) {
-
-            $conn = $this->pool->pop(0.1);
-            if ($conn) {
-                try {
-                    $conn['redis']->close();
-                } catch (Exception $e) {}
-            }
-        }
-
-        $this->current_connections->set(0);
-    }
-
-    /**
-     * 析构函数，确保连接被正确清理
-     */
-    public function __destruct()
-    {
-        try {
-            $this->closeAll();
-        } catch (Throwable $e) {
-            // 捕获异常，避免影响进程退出
-        }
+        return (strlen($infohash) === 20) ? $infohash : hex2bin($infohash);
     }
 }

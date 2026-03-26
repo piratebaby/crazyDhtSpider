@@ -52,12 +52,26 @@ class MysqlPool
         // 尝试从连接池中获取可用连接
         if (!empty($this->pool)) {
             $conn = array_pop($this->pool);
+            // 【新增：池化缩容逻辑】解决连接无法释放的问题
+            $idle_in_pool = time() - $conn['time']; // 计算在池子里的发呆时间
+            
+            // 如果在池子里闲置超过 30 秒，且当前 Worker 拥有的连接数大于 2 个（保留最低水位）
+            if ($idle_in_pool > 30 && $this->current_connections->get() > 2) {
+                try {
+                    $conn['conn']->close(); // 主动切断，让它安息
+                } catch (Exception $e) {}
+                
+                $this->current_connections->sub(1); // 计数器减 1
+                // 重新尝试获取连接
+                return $this->getConnection();
+            }
+            
             // 检查连接是否有效
-            if ($conn->ping()) {
-                return $conn;
+            if ($conn['conn']->ping()) {
+                return $conn['conn'];
             } else {
                 // 连接无效，关闭并减少计数
-                $conn->close();
+                $conn['conn']->close();
                 $this->current_connections->sub(1);
             }
         }
@@ -118,7 +132,11 @@ class MysqlPool
     public function returnConnection($conn)
     {
         if ($conn instanceof mysqli) {
-            $this->pool[] = $conn;
+            // 为连接添加时间戳
+            $this->pool[] = [
+                'conn' => $conn,
+                'time' => time()
+            ];
         }
     }
     
@@ -128,8 +146,8 @@ class MysqlPool
     public function closeAll()
     {
         foreach ($this->pool as $conn) {
-            if ($conn instanceof mysqli) {
-                $conn->close();
+            if (isset($conn['conn']) && $conn['conn'] instanceof mysqli) {
+                $conn['conn']->close();
             }
         }
         $this->pool = array();
