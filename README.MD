@@ -131,11 +131,9 @@ crazyDhtSpider/
 
 **Download mode combinations**:
 1. **Default full mode** (false, true, false): Local download, run DHT crawler, handle local and remote download requests
-2. **Remote forwarding mode** (true, false, false): All download tasks forwarded to remote server, local only runs DHT crawler
-3. **Dual download mode** (true, true, false): Priority use remote download forwarding, local as backup
-4. **Pure crawler mode** (false, false, false): Only run DHT crawler, do not handle any download requests
-5. **Dedicated download server mode** (false, true, true): Only handle download requests from other servers, do not run DHT crawler
-6. **Restricted mode** (any, any, true): When only_remote_requests is true, download forwarding is automatically disabled, only handle remote download requests
+2. **Remote forwarding mode** (true, any, false): All download tasks forwarded to remote server, local only runs DHT crawler
+3. **Pure crawler mode** (false, false, false): Only run DHT crawler, do not handle any download requests, usually not used
+4. **Dedicated download server mode** (any, any, true): Only handle download requests from other servers, do not run DHT crawler
 
 ### dht_server/config.php 
 
