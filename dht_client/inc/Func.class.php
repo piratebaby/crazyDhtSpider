@@ -106,7 +106,8 @@ class Func
                 try {
                     $result = mb_convert_encoding($array, 'UTF-8');
                 } catch (Exception $e) {
-                    self::Logs($array);
+                    // 转码失败返回原数据，避免undefined
+                    $result = $array;
                 }
                 return $result;
             }

@@ -20,6 +20,20 @@ class MySwoole
             swoole_set_process_name("php_dht_client_event_worker");
         }
         
+        // 保存IPv6端口的server fd，用于sendto时指定正确的端口
+        global $ipv6_server_fd;
+        $ipv6_server_fd = 0;
+        $ports = $serv->ports;
+        if (is_array($ports)) {
+            foreach ($ports as $port) {
+                $host = $port->host;
+                if (strpos($host, ':') !== false || $host === '::') {
+                    $ipv6_server_fd = $port->fd;
+                    break;
+                }
+            }
+        }
+        
         // 初始化task worker状态检查阈值
         if (self::$taskThreshold === null) {
             self::$taskThreshold = $config['application']['task_threshold'] ?? 0.8; // 默认值
@@ -61,9 +75,16 @@ class MySwoole
                     foreach ($nodes as $key => $node) {
                         // 处理关联数组格式的节点数据
                         if (isset($node['nid'], $node['ip'], $node['port'])) {
-                            $table->set($node['nid'], $node);
-                            // 同时更新IP+端口索引表
-                            $ip_port_key = $node['ip'] . ':' . $node['port'];
+                            $table->set($node['nid'], [
+                                'nid' => $node['nid'],
+                                'ip' => $node['ip'],
+                                'port' => $node['port'],
+                                'last_seen' => $node['last_seen'] ?? time()
+                            ]);
+                            // 同时更新IP+端口索引表，IPv6使用[ip]:port格式
+                            $ip_port_key = Base::is_ipv6($node['ip']) 
+                                ? '[' . $node['ip'] . ']:' . $node['port'] 
+                                : $node['ip'] . ':' . $node['port'];
                             $ip_port_index->set($ip_port_key, ['nid' => $node['nid']]);
                         }
                     }
@@ -166,6 +187,61 @@ class MySwoole
                         ]);
                     } else {
                         error_log('Failed to get nodes from table for saving');
+                    }
+                });
+
+                // 定时清理路由表：按 last_seen 排序，优先删除最久未通信的节点
+                global $table, $ip_port_index;
+                $cleanup_interval = ($config['application']['router_table_cleanup_interval'] ?? 30) * 1000; // 默认30秒
+                swoole_timer_tick($cleanup_interval, function ($timer_id) use ($table, $ip_port_index, $config) {
+                    if (!($table instanceof Swoole\Table)) {
+                        return;
+                    }
+
+                    $count = $table->count();
+                    $max_size = $config['application']['max_node_size'] ?? 200;
+
+                    if ($count < $max_size) {
+                        return;
+                    }
+
+                    // 收集所有节点及其 last_seen 时间
+                    $all_nodes = [];
+                    foreach ($table as $key => $node) {
+                        $all_nodes[] = [
+                            'nid' => $key,
+                            'last_seen' => $node['last_seen'] ?? 0,
+                            'ip' => $node['ip'],
+                            'port' => $node['port']
+                        ];
+                    }
+
+                    // 按 last_seen 升序排序（最久未通信的排前面）
+                    usort($all_nodes, function ($a, $b) {
+                        return $a['last_seen'] - $b['last_seen'];
+                    });
+
+                    // 计算需要删除的数量，保留 80%
+                    $target_count = floor($max_size * 0.8);
+                    $remove_count = $count - $target_count;
+
+                    $removed = 0;
+                    foreach ($all_nodes as $node) {
+                        if ($removed >= $remove_count) {
+                            break;
+                        }
+
+                        $ip_port_key = Base::is_ipv6($node['ip'])
+                            ? '[' . $node['ip'] . ']:' . $node['port']
+                            : $node['ip'] . ':' . $node['port'];
+
+                        $table->del($node['nid']);
+                        $ip_port_index->del($ip_port_key);
+                        $removed++;
+                    }
+
+                    if ($removed > 0) {
+                        error_log("Router table cleanup: removed {$removed} stale nodes, remaining: " . $table->count());
                     }
                 });
                 
@@ -277,26 +353,21 @@ class MySwoole
     private static function getRandomInfohash($redisPool, $infohash_key, $count = 1)
     {
         try {
-            // 从Redis连接池获取连接
-            $redis = $redisPool->getConnection();
-            if (!$redis) {
-                return $count > 1 ? [] : null;
-            }
-            
-            // 使用SRANDMEMBER命令获取Infohash
-            $infohashes = $count > 1 
-                ? $redis->srandmember($infohash_key, $count) 
-                : $redis->srandmember($infohash_key);
-            
-            // 释放连接
-            $redisPool->returnConnection($redis);
-            
+            $result = $redisPool->execute(function($redis) use ($infohash_key, $count) {
+                return $count > 1
+                    ? $redis->srandmember($infohash_key, $count)
+                    : $redis->srandmember($infohash_key);
+            });
+
             // 确保返回数组格式
-            if ($count > 1 && !is_array($infohashes)) {
-                $infohashes = $infohashes ? [$infohashes] : [];
+            if ($count > 1) {
+                if (!is_array($result)) {
+                    $result = $result ? [$result] : [];
+                }
+                return $result ?: [];
             }
-            
-            return $infohashes;
+
+            return $result;
         } catch (Exception $e) {
             error_log('Redis error in getRandomInfohash: ' . $e->getMessage());
             return $count > 1 ? [] : null;
@@ -379,7 +450,7 @@ class MySwoole
                 }
 
                 // 验证IP和端口
-                if (!filter_var($ip, FILTER_VALIDATE_IP) || $port < 1 || $port > 65535) {
+                if ((!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) || $port < 1 || $port > 65535) {
                     return false;
                 }
 
@@ -521,7 +592,7 @@ class MySwoole
         }
 
         // 验证IP和端口
-        if (!filter_var($ip, FILTER_VALIDATE_IP) || $port < 1 || $port > 65535) {
+        if ((!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) || $port < 1 || $port > 65535) {
             $task->finish("ERROR: Invalid IP or port");
             return;
         }
@@ -653,8 +724,9 @@ class MySwoole
     {
         global $config;
         
-        // 创建TCP客户端
-        $client = new Swoole\Client(SWOOLE_SOCK_TCP, SWOOLE_SOCK_SYNC);
+        // 根据目标IP类型创建TCP客户端
+        $sock_type = Base::is_ipv6($ip) ? SWOOLE_SOCK_TCP6 : SWOOLE_SOCK_TCP;
+        $client = new Swoole\Client($sock_type, SWOOLE_SOCK_SYNC);
         $client->set(array(
             'open_eof_check' => false,
             'package_max_length' => 1024 * 1024,
@@ -747,7 +819,8 @@ class MySwoole
                     $nodes[$key] = array(
                         'nid' => $node['nid'],
                         'ip' => $node['ip'],
-                        'port' => $node['port']
+                        'port' => $node['port'],
+                        'last_seen' => $node['last_seen'] ?? time()
                     );
                 }
             }
@@ -757,7 +830,8 @@ class MySwoole
                     $nodes[$node->nid] = array(
                         'nid' => $node->nid,
                         'ip' => $node->ip,
-                        'port' => $node->port
+                        'port' => $node->port,
+                        'last_seen' => time()
                     );
                 }
             }

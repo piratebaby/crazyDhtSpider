@@ -88,12 +88,16 @@ $GLOBALS['NODE_ID_UPDATE_RATIO'] = $NODE_ID_UPDATE_RATIO;
 $GLOBALS['NIDS_UPDATE_INTERVAL'] = $NIDS_UPDATE_INTERVAL;
 $GLOBALS['NODE_ID_FILE'] = $NODE_ID_FILE;
 
+// IPv6端口的server fd，在WorkerStart中初始化
+$ipv6_server_fd = 0;
+
 
 // 使用Swoole\Table实现进程间共享的路由表
 $table = new Swoole\Table($config['application']['max_node_size'] * $config['application']['table_size_multiplier']);
 $table->column('nid', Swoole\Table::TYPE_STRING, 20);
 $table->column('ip', Swoole\Table::TYPE_STRING, 45); // 增加ip字段长度以支持IPv6地址
 $table->column('port', Swoole\Table::TYPE_INT);
+$table->column('last_seen', Swoole\Table::TYPE_INT); // 最后通信时间戳
 $table->create();
 
 // 添加IP+端口索引表，用于快速查找节点，避免遍历整个路由表
@@ -108,8 +112,10 @@ $bootstrap_nodes = array(
     array('router.bittorrent.com', 6881),
     array('dht.transmissionbt.com', 6881),
     array('router.utorrent.com', 6881),
-    // IPv6引导节点
-    array('router.silotis.us', 6881)
+    // IPv6引导节点（router.silotis.us 已下线，替换为支持IPv6的节点）
+    array('dht.aelitis.com', 6881),           // Vuze/Azureus DHT，支持IPv6
+    array('router.bittorrent.com', 6881),     // 同时解析AAAA记录
+    array('dht.transmissionbt.com', 6881),    // 同时解析AAAA记录
 );
 
 // 记录启动信息到 start 日志

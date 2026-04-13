@@ -1,12 +1,3 @@
--- phpMyAdmin SQL Dump
--- version 5.2.2
--- https://www.phpmyadmin.net/
---
--- 主机： host-lax-ryzen.ixiaofeng.com
--- 生成日期： 2025-02-11 13:27:46
--- 服务器版本： 5.7.44
--- PHP 版本： 8.2.27
-
 SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
 START TRANSACTION;
 SET time_zone = "+00:00";
@@ -33,12 +24,12 @@ CREATE TABLE `bt` (
   `length` bigint(20) NOT NULL DEFAULT '0' COMMENT '文件大小',
   `piece_length` int(11) NOT NULL DEFAULT '0' COMMENT '种子大小',
   `infohash` char(40) NOT NULL COMMENT '种子哈希值',
-  `files` mediumtext COMMENT '文件列表',
+  `files` json DEFAULT NULL COMMENT '文件列表',
   `hits` int(11) NOT NULL DEFAULT '0' COMMENT '点击量',
   `hot` int(11) NOT NULL DEFAULT '1' COMMENT '热度',
   `time` datetime NOT NULL COMMENT '收录时间',
   `lasttime` datetime NOT NULL COMMENT '最后下载时间'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=COMPRESSED
 PARTITION BY KEY (infohash)
 (
 PARTITION p0 ENGINE=InnoDB,
@@ -82,6 +73,21 @@ PARTITION p30 ENGINE=InnoDB
 
 CREATE TABLE `history` (
   `infohash` char(40) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=COMPRESSED;
+
+-- --------------------------------------------------------
+
+--
+-- 表的结构 `torrent_indices`
+--
+
+CREATE TABLE `torrent_indices` (
+  `infohash` char(40) NOT NULL COMMENT '存储 40 位 HEX 字符串',
+  `file_category` varchar(20) NOT NULL DEFAULT 'Other' COMMENT '文件大类',
+  `primary_ext` varchar(64) DEFAULT NULL,
+  `total_size` bigint(20) UNSIGNED NOT NULL DEFAULT '0' COMMENT '总大小',
+  `file_count` int(10) UNSIGNED NOT NULL DEFAULT '1' COMMENT '文件数量',
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 --
@@ -93,7 +99,8 @@ CREATE TABLE `history` (
 --
 ALTER TABLE `bt`
   ADD UNIQUE KEY `infohash` (`infohash`) USING BTREE,
-  ADD KEY `hot` (`hot`);
+  ADD KEY `hot` (`hot`),
+  ADD KEY `idx_lasttime` (`lasttime`);
 
 --
 -- 表的索引 `history`
@@ -101,6 +108,12 @@ ALTER TABLE `bt`
 ALTER TABLE `history`
   ADD PRIMARY KEY (`infohash`),
   ADD UNIQUE KEY `infohash` (`infohash`) USING BTREE;
+
+--
+-- 表的索引 `torrent_indices`
+--
+ALTER TABLE `torrent_indices`
+  ADD PRIMARY KEY (`infohash`);
 COMMIT;
 
 /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;

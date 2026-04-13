@@ -75,6 +75,7 @@ return array(
         // 定时器相关配置
         'auto_find_time' => 1000,               // 自动查找节点的时间间隔（毫秒），从10000调整为15000，进一步降低任务生成频率
         'router_table_save_interval' => 60000,  // 路由表保存间隔（毫秒）
+        'router_table_cleanup_interval' => 30,  // 路由表清理间隔（秒），按last_seen排序优先删除最久未通信的节点
         'gc_interval' => 60000,                 // 垃圾回收间隔（毫秒）
         'task_status_check_interval' => 3000,   // Task Worker 状态检查间隔（毫秒），从2000调整为3000，减少检查频率
 

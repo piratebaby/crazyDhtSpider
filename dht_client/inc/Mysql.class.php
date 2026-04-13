@@ -49,80 +49,81 @@ class MysqlPool
      */
     public function getConnection()
     {
-        // 尝试从连接池中获取可用连接
-        if (!empty($this->pool)) {
-            $conn = array_pop($this->pool);
-            // 【新增：池化缩容逻辑】解决连接无法释放的问题
-            $idle_in_pool = time() - $conn['time']; // 计算在池子里的发呆时间
-            
-            // 如果在池子里闲置超过 30 秒，且当前 Worker 拥有的连接数大于 2 个（保留最低水位）
-            if ($idle_in_pool > 30 && $this->current_connections->get() > 2) {
-                try {
-                    $conn['conn']->close(); // 主动切断，让它安息
-                } catch (Exception $e) {}
-                
-                $this->current_connections->sub(1); // 计数器减 1
-                // 重新尝试获取连接
-                return $this->getConnection();
-            }
-            
-            // 检查连接是否有效
-            if ($conn['conn']->ping()) {
-                return $conn['conn'];
-            } else {
-                // 连接无效，关闭并减少计数
-                $conn['conn']->close();
-                $this->current_connections->sub(1);
-            }
-        }
-        
-        // 检查是否达到最大连接数，使用原子操作避免并发问题
-        if ($this->current_connections->add(1) <= $this->max_connections) {
-            // 连接重试机制
-            $retryCount = 0;
-            $maxRetries = 3;
-            $retryDelay = 100000; // 100毫秒
-            
-            while ($retryCount < $maxRetries) {
-                try {
-                    $conn = new mysqli();
-                    $conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, $this->config['timeout'] ?? 2);
-                    $conn->connect(
-                        $this->config['host'],
-                        $this->config['user'],
-                        $this->config['password'],
-                        $this->config['database'],
-                        $this->config['port'] ?? 3306
-                    );
-                    
-                    if ($conn->connect_error) {
-                        throw new Exception('MySQL connection error: ' . $conn->connect_error);
-                    }
-                    
-                    $conn->set_charset($this->config['charset'] ?? 'utf8mb4');
-                    return $conn;
-                } catch (Exception $e) {
-                    $retryCount++;
-                    if ($retryCount >= $maxRetries) {
-                        error_log('MySQL connection error after ' . $maxRetries . ' retries: ' . $e->getMessage());
-                        // 创建连接失败，减少计数
-                        $this->current_connections->sub(1);
-                        return null;
-                    }
-                    error_log('MySQL connection attempt ' . $retryCount . ' failed, retrying in ' . ($retryDelay / 1000) . 'ms: ' . $e->getMessage());
-                    usleep($retryDelay);
+        $waitStart = microtime(true);
+        $waitTimeout = 3; // 最大等待3秒
+
+        while (true) {
+            // 尝试从连接池中获取可用连接
+            if (!empty($this->pool)) {
+                $conn = array_pop($this->pool);
+                $idle_in_pool = time() - $conn['time'];
+
+                // 闲置超过30秒且当前连接数大于2，缩容释放
+                if ($idle_in_pool > 30 && $this->current_connections->get() > 2) {
+                    try {
+                        $conn['conn']->close();
+                    } catch (Exception $e) {}
+                    $this->current_connections->sub(1);
+                    continue; // 非递归，继续循环取下一个
+                }
+
+                // 检查连接是否有效
+                if ($conn['conn']->ping()) {
+                    return $conn['conn'];
+                } else {
+                    $conn['conn']->close();
+                    $this->current_connections->sub(1);
                 }
             }
-            
-            // 所有重试都失败，减少计数
-            $this->current_connections->sub(1);
-        } else {
-            // 连接数达到上限，减少计数
-            $this->current_connections->sub(1);
-            error_log('MySQL connection pool exhausted. Current: ' . $this->current_connections->get() . ', Max: ' . $this->max_connections);
+
+            // 尝试创建新连接
+            if ($this->current_connections->add(1) <= $this->max_connections) {
+                $retryCount = 0;
+                $maxRetries = 3;
+                $retryDelay = 100000;
+
+                while ($retryCount < $maxRetries) {
+                    try {
+                        $conn = new mysqli();
+                        $conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, $this->config['timeout'] ?? 2);
+                        $conn->connect(
+                            $this->config['host'],
+                            $this->config['user'],
+                            $this->config['password'],
+                            $this->config['database'],
+                            $this->config['port'] ?? 3306
+                        );
+
+                        if ($conn->connect_error) {
+                            throw new Exception('MySQL connection error: ' . $conn->connect_error);
+                        }
+
+                        $conn->set_charset($this->config['charset'] ?? 'utf8mb4');
+                        return $conn;
+                    } catch (Exception $e) {
+                        $retryCount++;
+                        if ($retryCount >= $maxRetries) {
+                            $this->current_connections->sub(1);
+                            error_log('MySQL connection error after ' . $maxRetries . ' retries: ' . $e->getMessage());
+                            return null;
+                        }
+                        usleep($retryDelay);
+                    }
+                }
+
+                $this->current_connections->sub(1);
+            } else {
+                $this->current_connections->sub(1);
+            }
+
+            // 超时检查
+            if (microtime(true) - $waitStart > $waitTimeout) {
+                error_log('MySQL connection pool timeout. Current: ' . $this->current_connections->get() . ', Max: ' . $this->max_connections);
+                return null;
+            }
+
+            usleep(10000); // 10ms
         }
-        
-        return null;
     }
     
     /**

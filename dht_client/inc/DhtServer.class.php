@@ -3,6 +3,49 @@
 class DhtServer
 {
     /**
+     * 解析域名为IP地址，同时支持 IPv4 和 IPv6
+     * @param string $hostname 域名
+     * @return array 返回解析到的IP地址列表，每个元素为 ['ip' => string, 'family' => 'ipv4'|'ipv6']
+     */
+    public static function resolve_hostname($hostname)
+    {
+        $results = [];
+
+        // 使用 dns_get_record 同时查询 A 和 AAAA 记录
+        if (function_exists('dns_get_record')) {
+            // 查询 A 记录（IPv4）
+            $a_records = @dns_get_record($hostname, DNS_A);
+            if (is_array($a_records)) {
+                foreach ($a_records as $record) {
+                    if (isset($record['ip']) && filter_var($record['ip'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                        $results[] = ['ip' => $record['ip'], 'family' => 'ipv4'];
+                    }
+                }
+            }
+
+            // 查询 AAAA 记录（IPv6）
+            $aaaa_records = @dns_get_record($hostname, DNS_AAAA);
+            if (is_array($aaaa_records)) {
+                foreach ($aaaa_records as $record) {
+                    if (isset($record['ipv6']) && filter_var($record['ipv6'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                        $results[] = ['ip' => $record['ipv6'], 'family' => 'ipv6'];
+                    }
+                }
+            }
+        }
+
+        // 兜底：如果 dns_get_record 没有结果，使用 gethostbyname
+        if (empty($results)) {
+            $ipv4 = gethostbyname($hostname);
+            if ($ipv4 !== $hostname && filter_var($ipv4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $results[] = ['ip' => $ipv4, 'family' => 'ipv4'];
+            }
+        }
+
+        return $results;
+    }
+
+    /**
      * 加入dht网络
      * @param array $table 路由表
      * @param array $bootstrap_nodes 引导节点列表
@@ -13,18 +56,13 @@ class DhtServer
             return;
         }
         
-        if ($table instanceof Swoole\Table) {
-            if ($table->count() == 0) {
-                foreach ($bootstrap_nodes as $node) {
-                    $resolvedIp = gethostbyname($node[0]);
-                    self::find_node(array($resolvedIp, $node[1])); //将自身伪造的ID 加入预定义的DHT网络
-                }
-            }
-        } else {
-            if (count($table) == 0) {
-                foreach ($bootstrap_nodes as $node) {
-                    $resolvedIp = gethostbyname($node[0]);
-                    self::find_node(array($resolvedIp, $node[1])); //将自身伪造的ID 加入预定义的DHT网络
+        $is_empty = ($table instanceof Swoole\Table) ? ($table->count() == 0) : (count($table) == 0);
+
+        if ($is_empty) {
+            foreach ($bootstrap_nodes as $node) {
+                $resolved = self::resolve_hostname($node[0]);
+                foreach ($resolved as $addr) {
+                    self::find_node(array($addr['ip'], $node[1]));
                 }
             }
         }
@@ -95,6 +133,16 @@ class DhtServer
         // 发送请求数据到对端
         self::send_response($msg, $address);
     }
+
+    /**
+     * 获取目标地址的地址族类型
+     * @param string $ip IP地址
+     * @return string 'ipv4' 或 'ipv6'
+     */
+    public static function get_address_family($ip)
+    {
+        return Base::is_ipv6($ip) ? 'ipv6' : 'ipv4';
+    }
     
     /**
      * 按目标地址选择合适的Node ID
@@ -102,7 +150,7 @@ class DhtServer
      * @param array $address 目标地址 [ip, port]
      * @return string 选择的Node ID
      */
-    private static function select_node_id_by_address($address)
+    public static function select_node_id_by_address($address)
     {
         global $nids;
         $ip = $address[0];
@@ -135,14 +183,27 @@ class DhtServer
 
     public static function send_response($msg, $address)
     {
-        global $serv;
+        global $serv, $ipv6_server_fd;
 
-        if (!filter_var($address[0], FILTER_VALIDATE_IP)) {
+        $ip = $address[0];
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
             return false;
         }
-        $ip = $address[0];
         $data = Base::encode($msg);
-        $serv->sendto($ip, $address[1], $data);
+
+        // 根据目标IP类型选择正确的server fd发送
+        if (Base::is_ipv6($ip)) {
+            // IPv6: 使用IPv6端口的server fd发送
+            if (isset($ipv6_server_fd) && $ipv6_server_fd > 0) {
+                $serv->sendto($ip, $address[1], $data, $ipv6_server_fd);
+            } else {
+                // 如果IPv6端口未初始化，尝试直接发送（某些Swoole版本支持自动选择）
+                $serv->sendto($ip, $address[1], $data);
+            }
+        } else {
+            // IPv4: 使用默认端口发送
+            $serv->sendto($ip, $address[1], $data);
+        }
     }
     
     /**

@@ -16,7 +16,7 @@ class Bencode
         try{
             return Bencode2::decode($str);
         }catch (ParseException $e){
-            $e->getMessage();
+            return false;
         }
     }
 

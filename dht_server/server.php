@@ -16,6 +16,8 @@ require_once "vendor/autoload.php";
 
 Func::Logs(date('Y-m-d H:i:s', time()) . " - 服务启动..." . PHP_EOL, 1);
 $serv = new Swoole\Server('0.0.0.0', 2345, SWOOLE_PROCESS, SWOOLE_SOCK_UDP);
+// 额外添加一个 IPv6 监听端口，支持dht_client通过IPv6发送metadata数据
+$serv->addListener('::', 2345, SWOOLE_SOCK_UDP6);
 $serv->set($config['server']);
 Swoole\Coroutine::set(['hook_flags' => SWOOLE_HOOK_ALL]);
 

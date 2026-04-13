@@ -2,7 +2,6 @@
 
 class Func
 {
-
     /*
      * 日志记录
      * @param $msg
@@ -10,20 +9,27 @@ class Func
      */
     public static function Logs($msg, $type = 1)
     {
+        $log_dir = BASEPATH . '/logs/';
+
         if ($type == 1) { //启动信息
-            $mode = 'ab';
-            $path = BASEPATH . '/logs/start_' . date('Ymd') . '.log';
+            $path = $log_dir . 'start_' . date('Ymd') . '.log';
         } elseif ($type == 2) { //hash信息
-            $mode = 'ab';
-            $path = BASEPATH . '/logs/hashInfo_' . date('Ymd') . '.log';
-        } else {
-            $mode = 'w';
-            $path = BASEPATH . '/logs/otherInfo_' . date('Ymd') . '.log';
+            $path = $log_dir . 'hashInfo_' . date('Ymd') . '.log';
+        } else { // 其他信息（状态日志等）
+            $path = $log_dir . 'otherInfo_' . date('Ymd') . '.log';
         }
 
-        $fp = fopen($path, $mode);
-        fwrite($fp, $msg);
-        fclose($fp);
+        // 确保日志目录存在
+        if (!is_dir($log_dir)) {
+            mkdir($log_dir, 0755, true);
+        }
+
+        // 统一使用追加模式，避免type=3的日志互相覆盖
+        $fp = fopen($path, 'ab');
+        if ($fp) {
+            fwrite($fp, $msg);
+            fclose($fp);
+        }
     }
 
     public static function sizecount($filesize)
@@ -98,7 +104,8 @@ class Func
                 try {
                     $result = mb_convert_encoding($array, 'UTF-8');
                 } catch (Exception $e) {
-                    self::Logs($array);
+                    // 转码失败返回原数据，避免undefined
+                    $result = $array;
                 }
                 return $result;
             }
@@ -109,15 +116,14 @@ class Func
     {
         return [
             'name' => $data['name'],
-            'keywords' => Func::getKeyWords($data['name']),
+            'keywords' => self::getKeyWords($data['name']),
             'infohash' => $data['infohash'],
             'files' => $data['files_json'],
             'length' => $data['files_length'],
             'piece_length' => $data['piece_length'],
             'hits' => 0,
             'hot' => 1,
-            'time' => date('Y-m-d H:i:s'),
-            'lasttime' => date('Y-m-d H:i:s'),
+            // time和lasttime在DbPool::sourceQuery中统一设为NOW()，不再重复生成
         ];
     }
 
@@ -125,7 +131,7 @@ class Func
     {
         $length = 0;
         if (!empty($data['files'])) {
-            $data['files_json'] = json_encode(Func::array_transcoding($data['files']), JSON_UNESCAPED_UNICODE);
+            $data['files_json'] = json_encode(self::array_transcoding($data['files']), JSON_UNESCAPED_UNICODE);
             if (!$data['files_json']) {
                 return [];
             }
@@ -134,8 +140,6 @@ class Func
             }
             $data['files_length'] = $length;
         } else {
-            // 为JSON类型字段提供有效的空JSON对象
-            // 确保无论客户端发送什么内容，都转换为有效的JSON格式
             $data['files_json'] = '{}';
             $data['files_length'] = $data['length'];
         }

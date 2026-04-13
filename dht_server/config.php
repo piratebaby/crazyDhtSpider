@@ -4,7 +4,7 @@ return array(
     'server' => array(
         'reload_async' => true, //设置为 true 时，将启用异步安全重启特性，Worker 进程会等待异步事件完成后再退出
         'daemonize' => true, //是否后台守护进程
-        'enable_coroutine' => false, //是否开启协程
+        'enable_coroutine' => true, //必须开启协程，packet回调中使用了Coroutine::create
         'worker_num' => 4, //设置启动的worker进程数
         'max_request' => 5000, //防止 PHP 内存溢出, 一个工作进程处理 X 次任务后自动重启
         'max_wait_time' => 30, //worker退出之前最大等待时间
