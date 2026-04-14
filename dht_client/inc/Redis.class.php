@@ -158,6 +158,9 @@ class RedisPool
     {
         return $this->execute(function($redis) use ($infohash) {
             $infohash_bin = $this->normalizeInfohash($infohash);
+            if ($infohash_bin === false) {
+                return false;
+            }
             $set_key = ($this->config['prefix'] ?? '') . 'infohashes';
             return (bool)$redis->sIsMember($set_key, $infohash_bin);
         });
@@ -168,6 +171,9 @@ class RedisPool
         if (strlen($infohash) === 40 && ctype_xdigit($infohash)) {
             return hex2bin($infohash);
         }
-        return (strlen($infohash) === 20) ? $infohash : hex2bin($infohash);
+        if (strlen($infohash) === 20) {
+            return $infohash;
+        }
+        return false;
     }
 }

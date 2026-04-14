@@ -105,6 +105,12 @@ $ip_port_index = new Swoole\Table($config['application']['max_node_size'] * $con
 $ip_port_index->column('nid', Swoole\Table::TYPE_STRING, 20);
 $ip_port_index->create();
 
+// announce_peer去重表：记录ip:infohash，短时间窗口内防重复
+$announce_dedup_table = new Swoole\Table(8192);
+$announce_dedup_table->column('ts', Swoole\Table::TYPE_INT);
+$announce_dedup_table->create();
+DhtClient::$announce_dedup_table = $announce_dedup_table;
+
 
 $time = microtime(true);
 $bootstrap_nodes = array(

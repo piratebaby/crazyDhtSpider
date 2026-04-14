@@ -7,7 +7,8 @@ class DhtClient
     public static $BT_MSG_ID = 20;
     public static $EXT_HANDSHAKE_ID = 0;
     public static $PIECE_LENGTH = 16384;
-    public static $last_ip = '';
+    public static $announce_dedup_table = null;
+    public static $stats_cache = ['data' => null, 'ts' => 0];
 
     /**
      * 处理接收到的find_node回复
@@ -318,22 +319,34 @@ class DhtClient
             )
         );
 
-        if ($address[0] == self::$last_ip) {
+        // 使用Swoole\Table做ip:infohash短时间去重，替代简单的$last_ip过滤
+        $dedup_key = $address[0] . ':' . $infohash;
+        if (self::$announce_dedup_table !== null && self::$announce_dedup_table->exists($dedup_key)) {
+            // 同一IP同一infohash在去重窗口内重复，跳过（但仍回复DHT响应）
+            DhtServer::send_response($msg, $address);
             return;
         }
-        self::$last_ip = $ip = $address[0];
+        if (self::$announce_dedup_table !== null) {
+            self::$announce_dedup_table->set($dedup_key, ['ts' => time()]);
+        }
+        $ip = $address[0];
         // 发送请求回复
         DhtServer::send_response($msg, $address);
 
-        // 检查当前任务数量，如果过多则暂时不提交新任务
-        $stats = $serv->stats();
-        // 留10%的缓冲，避免超过task_worker_num的配置
-        $max_tasks = max(1, floor($stats['task_worker_num'] * 0.9));
+        // 检查当前任务数量，如果过多则暂时不提交新任务（使用缓存stats，每秒更新）
+        $now = time();
+        if (self::$stats_cache['data'] === null || $now - self::$stats_cache['ts'] >= 1) {
+            self::$stats_cache['data'] = $serv->stats();
+            self::$stats_cache['ts'] = $now;
+        }
+        $stats = self::$stats_cache['data'];
+        $threshold = $config['application']['task_threshold'] ?? 0.9;
+        $max_tasks = max(1, floor($stats['task_worker_num'] * $threshold));
         if ($stats['tasking_num'] >= $max_tasks) {
             return;
         }
 
-        $task_id = $serv->task(array('ip' => $ip, 'port' => $port, 'infohash' => serialize($infohash)));
+        $task_id = MySwoole::enqueueDownload($serv, $ip, $port, $infohash);
         //echo "Dispath AsyncTask: [id=$task_id]\n";
         return;
     }

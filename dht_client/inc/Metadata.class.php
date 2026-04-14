@@ -3,6 +3,9 @@
 /**
  * Metadata 下载类
  * 基于 BEP 0009 (Extension for Peers to Send Metadata Files) 实现
+ * 同时适配 Swoole\Coroutine\Client（协程客户端）和 Swoole\Client（同步客户端）
+ *
+ * 重构为实例化：每个下载任务拥有独立的读缓冲区，支持同进程内多协程并发下载
  */
 class Metadata
 {
@@ -11,13 +14,41 @@ class Metadata
     public static $EXT_HANDSHAKE_ID = 0;
     public static $PIECE_LENGTH = 16384;
 
+    /** @var string 实例级读缓冲区（协程模式使用，每个下载任务独立） */
+    private $buffer = '';
+
+    /** @var bool 是否为协程客户端 */
+    private $isCoroutine = false;
+
     /**
-     * 下载种子元数据
-     * @param Swoole\Client $client 已连接的TCP客户端
+     * 下载种子元数据（静态入口，兼容旧调用方式）
+     * @param Swoole\Client|Swoole\Coroutine\Client $client 已连接的TCP客户端
      * @param string $infohash 20字节的infohash
      * @return array|false 成功返回元数据数组，失败返回false
      */
     public static function download_metadata($client, $infohash)
+    {
+        $instance = new self($client);
+        return $instance->doDownload($client, $infohash);
+    }
+
+    /**
+     * 构造函数，根据客户端类型初始化
+     * @param Swoole\Client|Swoole\Coroutine\Client $client
+     */
+    public function __construct($client)
+    {
+        $this->isCoroutine = ($client instanceof Swoole\Coroutine\Client);
+        $this->buffer = '';
+    }
+
+    /**
+     * 执行下载
+     * @param Swoole\Client|Swoole\Coroutine\Client $client
+     * @param string $infohash
+     * @return array|false
+     */
+    private function doDownload($client, $infohash)
     {
         $result = false;
         $_data = [];
@@ -27,23 +58,23 @@ class Metadata
             $total_timeout = 30;
 
             // 1. BT握手
-            $packet = self::send_handshake($client, $infohash);
+            $packet = $this->send_handshake($client, $infohash);
             if ($packet === false || microtime(true) - $start_time > $total_timeout) {
                 return false;
             }
 
-            if (!self::check_handshake($packet, $infohash)) {
+            if (!$this->check_handshake($packet, $infohash)) {
                 return false;
             }
 
             // 2. 扩展握手
-            $packet = self::send_ext_handshake($client);
+            $packet = $this->send_ext_handshake($client);
             if ($packet === false || microtime(true) - $start_time > $total_timeout) {
                 return false;
             }
 
             // 3. 解析扩展握手响应，获取ut_metadata id和metadata_size
-            $ext_info = self::parse_ext_handshake($packet);
+            $ext_info = $this->parse_ext_handshake($packet);
             if ($ext_info === false) {
                 return false;
             }
@@ -65,32 +96,33 @@ class Metadata
                 return false;
             }
 
-            // 4. 逐piece请求元数据
+            // 4. 滑动窗口请求元数据
             $received_pieces = [];
             $next_piece = 0;
+            $window_size = 8;
+            $inflight = 0;
+
+            // 初始填充窗口
+            while ($next_piece < $piecesNum && $inflight < $window_size) {
+                if (!$this->request_metadata($client, $ut_metadata, $next_piece)) {
+                    return false;
+                }
+                $next_piece++;
+                $inflight++;
+            }
 
             while (count($received_pieces) < $piecesNum) {
                 if (microtime(true) - $start_time > $total_timeout) {
                     return false;
                 }
 
-                // 请求下一个未请求的piece
-                if ($next_piece < $piecesNum) {
-                    if (!self::request_metadata($client, $ut_metadata, $next_piece)) {
-                        return false;
-                    }
-                    $next_piece++;
-                }
-
-                // 接收数据
-                $packet = self::recvall($client);
+                $packet = $this->recvall($client);
                 if ($packet === false) {
                     return false;
                 }
 
-                // 解析一个或多个piece响应
                 while (strlen($packet) > 0) {
-                    $piece_result = self::parse_metadata_piece($packet);
+                    $piece_result = $this->parse_metadata_piece($packet);
                     if ($piece_result === false) {
                         break;
                     }
@@ -99,9 +131,16 @@ class Metadata
                         $piece_index = $piece_result['piece'];
                         if (!isset($received_pieces[$piece_index]) && $piece_index < $piecesNum) {
                             $received_pieces[$piece_index] = $piece_result['data'];
+                            $inflight--;
+                            while ($next_piece < $piecesNum && $inflight < $window_size) {
+                                if (!$this->request_metadata($client, $ut_metadata, $next_piece)) {
+                                    return false;
+                                }
+                                $next_piece++;
+                                $inflight++;
+                            }
                         }
                     } elseif ($piece_result['msg_type'] == 2) {
-                        // reject消息，对端拒绝提供元数据
                         return false;
                     }
 
@@ -149,13 +188,9 @@ class Metadata
     }
 
     /**
-     * 发送元数据piece请求 (BEP 0009)
-     * @param Swoole\Client $client
-     * @param int $ut_metadata 扩展消息ID
-     * @param int $piece piece索引
-     * @return bool 是否发送成功
+     * 发送元数据piece请求
      */
-    public static function request_metadata($client, $ut_metadata, $piece)
+    private function request_metadata($client, $ut_metadata, $piece)
     {
         $msg = chr(self::$BT_MSG_ID) . chr($ut_metadata) . Base::encode(array("msg_type" => 0, "piece" => $piece));
         $msg_len = pack("N", strlen($msg));
@@ -166,56 +201,109 @@ class Metadata
     }
 
     /**
-     * 接收完整的数据包
-     * @param Swoole\Client $client
-     * @return string|false
+     * 精确读取指定字节数
      */
-    public static function recvall($client)
+    private function recvExact($client, $length)
     {
-        // 读取4字节长度前缀
-        $data_length = $client->recv(4, true);
-        if ($data_length === false || strlen($data_length) != 4) {
-            return false;
+        if (!$this->isCoroutine) {
+            return $client->recv($length, true);
         }
 
-        $length = unpack('N', $data_length)[1];
-        if ($length == 0) {
-            // keep-alive消息，继续读下一个
-            return self::recvall($client);
-        }
-
-        // 安全限制：单个消息不超过16MB
-        if ($length > 16777216) {
-            return false;
-        }
-
-        // 读取指定长度的数据
-        $data = '';
-        $remaining = $length;
-        while ($remaining > 0) {
-            $chunk_size = min($remaining, 65536);
-            $chunk = $client->recv($chunk_size, true);
-            if ($chunk === false || $chunk === '') {
+        while (strlen($this->buffer) < $length) {
+            if (!$this->fillBuffer($client)) {
                 return false;
             }
-            $data .= $chunk;
-            $remaining -= strlen($chunk);
         }
 
-        return $data;
+        $result = substr($this->buffer, 0, $length);
+        $this->buffer = substr($this->buffer, $length);
+        return $result;
+    }
+
+    /**
+     * 从网络填充内部缓冲区（仅协程模式）
+     */
+    private function fillBuffer($client, $timeout = 1.0)
+    {
+        $data = $client->recv($timeout);
+        if ($data === false || $data === '') {
+            return false;
+        }
+        $this->buffer .= $data;
+        return true;
+    }
+
+    /**
+     * 接收完整的BT消息（4字节长度前缀 + 负载），自动跳过 keep-alive
+     */
+    private function recvall($client)
+    {
+        if (!$this->isCoroutine) {
+            while (true) {
+                $header = $client->recv(4, true);
+                if ($header === false || strlen($header) < 4) {
+                    return false;
+                }
+
+                $length = unpack('N', $header)[1];
+
+                if ($length == 0) {
+                    continue;
+                }
+
+                if ($length > 16777216) {
+                    return false;
+                }
+
+                $payload = $client->recv($length, true);
+                if ($payload === false || strlen($payload) < $length) {
+                    return false;
+                }
+
+                return $payload;
+            }
+        }
+
+        // 协程客户端模式
+        while (true) {
+            if (strlen($this->buffer) < 4) {
+                if (!$this->fillBuffer($client)) {
+                    return false;
+                }
+                continue;
+            }
+
+            $length = unpack('N', substr($this->buffer, 0, 4))[1];
+
+            if ($length == 0) {
+                $this->buffer = substr($this->buffer, 4);
+                continue;
+            }
+
+            if ($length > 16777216) {
+                return false;
+            }
+
+            $total = 4 + $length;
+            while (strlen($this->buffer) < $total) {
+                if (!$this->fillBuffer($client)) {
+                    return false;
+                }
+            }
+
+            $result = substr($this->buffer, 4, $length);
+            $this->buffer = substr($this->buffer, $total);
+            return $result;
+        }
     }
 
     /**
      * 发送BT协议握手
-     * @param Swoole\Client $client
-     * @param string $infohash
-     * @return string|false 返回握手响应或false
      */
-    public static function send_handshake($client, $infohash)
+    private function send_handshake($client, $infohash)
     {
         $bt_protocol = self::$_bt_protocol;
         $bt_header = chr(strlen($bt_protocol)) . $bt_protocol;
-        // 保留字节：第5字节bit 0 = 扩展协议支持 (0x10)
         $ext_bytes = "\x00\x00\x00\x00\x00\x10\x00\x00";
         $peer_id = Base::get_node_id();
         $packet = $bt_header . $ext_bytes . $infohash . $peer_id;
@@ -225,8 +313,7 @@ class Metadata
             return false;
         }
 
-        // BT握手响应固定68字节：1 + 19 + 8 + 20 + 20
-        $data = $client->recv(68, true);
+        $data = $this->recvExact($client, 68);
         if ($data === false || strlen($data) < 68) {
             return false;
         }
@@ -236,11 +323,8 @@ class Metadata
 
     /**
      * 验证BT握手响应
-     * @param string $packet 握手响应数据
-     * @param string $self_infohash 期望的infohash
-     * @return bool
      */
-    public static function check_handshake($packet, $self_infohash)
+    private function check_handshake($packet, $self_infohash)
     {
         if (strlen($packet) < 68) {
             return false;
@@ -256,13 +340,11 @@ class Metadata
             return false;
         }
 
-        // 检查保留字节中是否支持扩展协议（第5字节bit 5 = 0x10）
         $reserved = substr($packet, 1 + $bt_header_len, 8);
         if ((ord($reserved[5]) & 0x10) === 0) {
             return false;
         }
 
-        // 验证infohash匹配
         $infohash = substr($packet, 1 + $bt_header_len + 8, 20);
         if ($infohash !== $self_infohash) {
             return false;
@@ -273,10 +355,8 @@ class Metadata
 
     /**
      * 发送扩展握手
-     * @param Swoole\Client $client
-     * @return string|false
      */
-    public static function send_ext_handshake($client)
+    private function send_ext_handshake($client)
     {
         $msg = chr(self::$BT_MSG_ID) . chr(self::$EXT_HANDSHAKE_ID) . Base::encode(array("m" => array("ut_metadata" => 1)));
         $msg_len = pack("N", strlen($msg));
@@ -287,7 +367,7 @@ class Metadata
             return false;
         }
 
-        $data = self::recvall($client);
+        $data = $this->recvall($client);
         if ($data === false || $data === '') {
             return false;
         }
@@ -296,14 +376,10 @@ class Metadata
     }
 
     /**
-     * 解析扩展握手响应，获取ut_metadata和metadata_size
-     * @param string $data 扩展握手响应
-     * @return array|false ['ut_metadata' => int, 'metadata_size' => int] 或 false
+     * 解析扩展握手响应
      */
-    public static function parse_ext_handshake($data)
+    private function parse_ext_handshake($data)
     {
-        // 扩展握手消息格式：[1字节BT_MSG_ID=0] + [1字节ext_id=0] + [bencode字典]
-        // 但recvall已去掉了长度前缀，所以数据从BT_MSG_ID开始
         if (strlen($data) < 2) {
             return false;
         }
@@ -341,10 +417,8 @@ class Metadata
 
     /**
      * 解析元数据piece响应
-     * @param string $packet 数据包（不含长度前缀）
-     * @return array|false ['msg_type' => int, 'piece' => int, 'data' => string, 'remaining' => string] 或 false
      */
-    public static function parse_metadata_piece(&$packet)
+    private function parse_metadata_piece(&$packet)
     {
         if (strlen($packet) < 2) {
             return false;
@@ -355,11 +429,9 @@ class Metadata
             return false;
         }
 
-        // 尝试找到bencode字典的结尾 "e" 标记
         $dict_start = 2;
         $bencode_str = substr($packet, $dict_start);
 
-        // 找到bencode字典的完整边界
         $dict_end = self::find_bencode_end($bencode_str);
         if ($dict_end === false) {
             return false;
@@ -378,10 +450,8 @@ class Metadata
         $remaining = '';
 
         if ($msg_type == 1 && isset($dict['piece'])) {
-            // data消息：piece数据紧跟在bencode字典之后
             $remaining = '';
         } else {
-            // reject或其他消息，没有额外数据
             $piece_data = '';
             $remaining = substr($packet, $total_dict_len);
         }
@@ -395,9 +465,7 @@ class Metadata
     }
 
     /**
-     * 找到bencode编码数据的完整边界
-     * @param string $data 从字典起始位置开始的数据
-     * @return int|false bencode数据的字节长度，或false
+     * 找到bencode编码数据的完整边界（栈迭代，无递归）
      */
     private static function find_bencode_end($data)
     {
@@ -405,16 +473,21 @@ class Metadata
             return false;
         }
 
-        $pos = 1; // 跳过起始的 'd'
         $len = strlen($data);
+        $stack = [];
+        $pos = 0;
 
-        while ($pos < $len) {
+        $stack[] = ['type' => 'd', 'start' => $pos];
+        $pos++;
+
+        while ($pos < $len && !empty($stack)) {
             if ($data[$pos] === 'e') {
-                return $pos + 1; // 包含结尾的 'e'
+                array_pop($stack);
+                $pos++;
+                continue;
             }
 
             if ($data[$pos] >= '0' && $data[$pos] <= '9') {
-                // 字符串：格式 <length>:<data>
                 $colon_pos = strpos($data, ':', $pos);
                 if ($colon_pos === false) {
                     return false;
@@ -422,22 +495,21 @@ class Metadata
                 $str_len = intval(substr($data, $pos, $colon_pos - $pos));
                 $pos = $colon_pos + 1 + $str_len;
             } elseif ($data[$pos] === 'i') {
-                // 整数：格式 i<number>e
                 $e_pos = strpos($data, 'e', $pos + 1);
                 if ($e_pos === false) {
                     return false;
                 }
                 $pos = $e_pos + 1;
             } elseif ($data[$pos] === 'l' || $data[$pos] === 'd') {
-                // 嵌套列表或字典，递归查找
-                $inner_end = self::find_bencode_end(substr($data, $pos));
-                if ($inner_end === false) {
-                    return false;
-                }
-                $pos += $inner_end;
+                $stack[] = ['type' => $data[$pos], 'start' => $pos];
+                $pos++;
             } else {
                 return false;
             }
+        }
+
+        if (empty($stack)) {
+            return $pos;
         }
 
         return false;

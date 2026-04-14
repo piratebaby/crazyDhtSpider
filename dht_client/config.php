@@ -8,7 +8,7 @@ return array(
     'server' => array(
         'daemonize' => true,                    // 是否后台守护进程
         'worker_num' => 2,                      // 主进程数, 一般为CPU的1至2倍 降低内存占用
-        'task_worker_num' => 200,               // task进程的数量 值越大内存占用越高 根据自己的实际情况设置
+        'task_worker_num' => 60,               // task进程的数量 值越大内存占用越高 根据自己的实际情况设置,如果use_coroutine_client设置为true，需要设置小一些。非协程模式的时候taskworker的数量除以coroutine_concurrency的值即可。例如非协程模式的时候需要300那协程模式60即可。
         'max_conn' => 65535,                    // 最大连接数
         'reload_async' => true,                 // 设置为 true 时，将启用异步安全重启特性，Worker 进程会等待异步事件完成后再退出
         'max_request' => 0,                     // 防止 PHP 内存溢出, 一个工作进程处理 X 次任务后自动重启
@@ -35,6 +35,8 @@ return array(
         'enable_remote_download' => false,      // 是否启用远程下载转发，即所有下载metadata任务都转发给专门的服务器
         'enable_local_download' => true,        // 是否启用本地下载
         'only_remote_requests' => false,        // 是否只处理来自其他服务器的下载请求（不执行本地爬虫和下载转发）
+        'use_coroutine_client' => true,         // metadata下载是否使用协程客户端（true=协程客户端，false=同步客户端）
+        'coroutine_concurrency' => 5,           // 协程模式下每个task worker内的并发下载数（仅use_coroutine_client=true时生效，建议1-10）
         
         /*
          * 下载模式参数说明：
@@ -73,7 +75,7 @@ return array(
         'node_id_update_ratio' => 0.3,          // 每次更新的Node ID比例
 
         // 定时器相关配置
-        'auto_find_time' => 1000,               // 自动查找节点的时间间隔（毫秒），从10000调整为15000，进一步降低任务生成频率
+        'auto_find_time' => 3000,               // 自动查找节点的时间间隔（毫秒），从10000调整为15000，进一步降低任务生成频率
         'router_table_save_interval' => 60000,  // 路由表保存间隔（毫秒）
         'router_table_cleanup_interval' => 30,  // 路由表清理间隔（秒），按last_seen排序优先删除最久未通信的节点
         'gc_interval' => 60000,                 // 垃圾回收间隔（毫秒）

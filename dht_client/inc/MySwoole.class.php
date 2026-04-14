@@ -10,6 +10,12 @@ class MySwoole
     
     // 钓鱼式探测执行标志
     private static $fishingDetectionRunning = false;
+
+    // 下载任务攒批缓冲区（每个event worker进程独立）
+    private static $pendingDownloads = [];
+
+    // 攒批定时器ID
+    private static $batchTimerId = null;
     public static function workStart($serv, $worker_id)
     {
         global $config;
@@ -254,6 +260,22 @@ class MySwoole
                         self::performFishingDetection($table, $redisPool, $config);
                     });
                 }
+
+                // 定时清理announce去重表（每30秒清理超过60秒的记录）
+                swoole_timer_tick(30000, function ($timer_id) {
+                    $dedup_table = DhtClient::$announce_dedup_table;
+                    if ($dedup_table === null) return;
+                    $expire = time() - 60;
+                    $keys_to_delete = [];
+                    foreach ($dedup_table as $key => $row) {
+                        if ($row['ts'] < $expire) {
+                            $keys_to_delete[] = $key;
+                        }
+                    }
+                    foreach ($keys_to_delete as $key) {
+                        $dedup_table->del($key);
+                    }
+                });
             }
         }
     }
@@ -514,6 +536,9 @@ class MySwoole
                 case 'save_router_table':
                     self::handleSaveRouterTableTask($task);
                     break;
+                case 'batch_download_metadata':
+                    self::handleBatchDownloadTask($task);
+                    break;
                 case 'local_download_metadata':
                 default:
                     self::handleDownloadMetadataTask($task);
@@ -543,11 +568,11 @@ class MySwoole
         }
         
         try {
-            // 序列化路由表数据
-            $serialized_data = serialize($nodes);
+            // 使用JSON序列化路由表数据，与loadRouterTableFromFile保持一致
+            $serialized_data = json_encode($nodes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             if ($serialized_data === false) {
-                error_log('Failed to serialize router table data');
-                $task->finish("ERROR: Serialization failed");
+                error_log('Failed to json_encode router table data');
+                $task->finish("ERROR: JSON encoding failed");
                 return;
             }
 
@@ -582,11 +607,11 @@ class MySwoole
         // 提取任务数据
         $ip = $task->data['ip'] ?? null;
         $port = $task->data['port'] ?? null;
-        $infohash_serialized = $task->data['infohash'] ?? null;
+        $infohash_raw = $task->data['infohash'] ?? null;
         $task_type = $task->data['type'] ?? null;
 
         // 验证任务数据完整性
-        if (empty($ip) || empty($port) || empty($infohash_serialized)) {
+        if (empty($ip) || empty($port) || empty($infohash_raw)) {
             $task->finish("ERROR: Incomplete task data");
             return;
         }
@@ -597,11 +622,11 @@ class MySwoole
             return;
         }
 
-        // 反序列化infohash
-        $infohash = @unserialize($infohash_serialized);
+        // 兼容处理infohash：支持直接的20字节字符串或旧的serialize格式
+        $infohash = @unserialize($infohash_raw);
         if ($infohash === false) {
-            $task->finish("ERROR: Invalid infohash");
-            return;
+            // 不是serialize格式，直接使用原始值
+            $infohash = $infohash_raw;
         }
 
         // 检查是否只处理来自其他服务器的下载请求
@@ -634,7 +659,7 @@ class MySwoole
         
         if ($enable_remote_download) {
             // 转发请求到远程下载服务器
-            self::forwardDownloadRequest($task, $ip, $port, $infohash_serialized);
+            self::forwardDownloadRequest($task, $ip, $port, $infohash_raw);
         } elseif ($enable_local_download) {
             // 本地执行下载
             self::executeLocalDownload($task, $ip, $port, $infohash);
@@ -691,7 +716,7 @@ class MySwoole
      * @param int $port 端口
      * @param string $infohash_serialized 序列化的infohash
      */
-    private static function forwardDownloadRequest($task, $ip, $port, $infohash_serialized)
+    private static function forwardDownloadRequest($task, $ip, $port, $infohash_raw)
     {
         global $config;
         
@@ -704,7 +729,7 @@ class MySwoole
             'type' => 'download_metadata',
             'ip' => $ip,
             'port' => $port,
-            'infohash' => $infohash_serialized
+            'infohash' => $infohash_raw
         );
         
         // 发送到下载服务器
@@ -724,35 +749,272 @@ class MySwoole
     {
         global $config;
         
-        // 根据目标IP类型创建TCP客户端
+        $use_coroutine = $config['application']['use_coroutine_client'] ?? true;
         $sock_type = Base::is_ipv6($ip) ? SWOOLE_SOCK_TCP6 : SWOOLE_SOCK_TCP;
-        $client = new Swoole\Client($sock_type, SWOOLE_SOCK_SYNC);
-        $client->set(array(
-            'open_eof_check' => false,
-            'package_max_length' => 1024 * 1024,
-            'connect_timeout' => 0.5, // 连接超时
-            'timeout' => 1, // 读写超时
-        ));
 
-        // 连接到目标服务器
-        if (@$client->connect($ip, $port, 0.5)) {
+        if ($use_coroutine) {
+            $client = new Swoole\Coroutine\Client($sock_type);
+            $client->set(array(
+                'open_eof_check' => false,
+                'package_max_length' => 1024 * 1024,
+                'connect_timeout' => 0.5,
+                'timeout' => 1,
+            ));
+        } else {
+            $client = new Swoole\Client($sock_type, SWOOLE_SOCK_SYNC);
+            $client->set(array(
+                'open_eof_check' => false,
+                'package_max_length' => 1024 * 1024,
+            ));
+        }
+
+        $connected = @$client->connect($ip, $port, 0.5);
+
+        if ($connected) {
             try {
-                // 执行下载，确保不超时
                 $rs = Metadata::download_metadata($client, $infohash);
                 if ($rs !== false && is_array($rs)) {
-                    // 发送响应
                     DhtServer::send_response($rs, array($config['application']['server_ip'] ?? '127.0.0.1', $config['application']['server_port'] ?? 6882));
                 }
             } catch (Throwable $e) {
                 error_log('Metadata download error: ' . $e->getMessage());
             } finally {
-                // 确保客户端关闭，释放资源
                 $client->close(true);
             }
         }
 
-        // 确保任务及时完成
         $task->finish("OK");
+    }
+
+    /**
+     * 处理批量下载任务（协程并发）
+     * 协程模式下，一个task worker内同时启动多个协程并发下载
+     * @param object $task 任务对象
+     */
+    private static function handleBatchDownloadTask($task)
+    {
+        global $config;
+
+        $items = $task->data['items'] ?? [];
+        if (empty($items) || !is_array($items)) {
+            $task->finish("ERROR: Empty batch");
+            return;
+        }
+
+        $use_coroutine = $config['application']['use_coroutine_client'] ?? true;
+        $concurrency = intval($config['application']['coroutine_concurrency'] ?? 5);
+
+        // 先过滤已存在的infohash
+        $valid_items = [];
+        foreach ($items as $item) {
+            $infohash_raw = $item['infohash'] ?? null;
+            $infohash = @unserialize($infohash_raw);
+            if ($infohash === false) {
+                $infohash = $infohash_raw;
+            }
+            if (empty($item['ip']) || empty($item['port']) || empty($infohash)) {
+                continue;
+            }
+            if (self::checkInfohashExists($infohash)) {
+                continue;
+            }
+            $item['_infohash_decoded'] = $infohash;
+            $valid_items[] = $item;
+        }
+
+        if (empty($valid_items)) {
+            $task->finish("OK: All infohashes already exist");
+            return;
+        }
+
+        // 检查下载转发配置
+        $enable_remote_download = $config['application']['enable_remote_download'] ?? false;
+        $enable_local_download = $config['application']['enable_local_download'] ?? true;
+        $only_remote_requests = $config['application']['only_remote_requests'] ?? false;
+        if ($only_remote_requests) {
+            $enable_remote_download = false;
+        }
+
+        if (!$enable_local_download && !$enable_remote_download) {
+            $task->finish("ERROR: Download functionality is disabled");
+            return;
+        }
+
+        // 远程转发模式：逐个转发
+        if ($enable_remote_download) {
+            foreach ($valid_items as $item) {
+                self::forwardSingleDownload($item['ip'], $item['port'], $item['infohash']);
+            }
+            $task->finish("OK: Batch forwarded");
+            return;
+        }
+
+        // 同步客户端模式：逐个串行下载
+        if (!$use_coroutine) {
+            foreach ($valid_items as $item) {
+                self::downloadSingle($item['ip'], $item['port'], $item['_infohash_decoded']);
+            }
+            $task->finish("OK: Batch downloaded (sync)");
+            return;
+        }
+
+        // 协程客户端模式：并发下载
+        $total = count($valid_items);
+        $results = new Swoole\Coroutine\Channel($total);
+        $concurrency = max(1, min($concurrency, $total));
+
+        // 使用channel控制并发数
+        $semaphore = new Swoole\Coroutine\Channel($concurrency);
+        for ($i = 0; $i < $concurrency; $i++) {
+            $semaphore->push(true);
+        }
+
+        $wg = new Swoole\Coroutine\WaitGroup();
+
+        foreach ($valid_items as $item) {
+            $semaphore->pop(); // 获取令牌，控制并发数
+            $wg->add();
+
+            Swoole\Coroutine::create(function () use ($item, $results, $semaphore, $wg, $config) {
+                try {
+                    $rs = self::downloadSingle($item['ip'], $item['port'], $item['_infohash_decoded']);
+                    $results->push(['infohash' => strtoupper(bin2hex($item['_infohash_decoded'])), 'success' => $rs]);
+                } catch (Throwable $e) {
+                    error_log('Coroutine download error: ' . $e->getMessage());
+                } finally {
+                    $semaphore->push(true); // 归还令牌
+                    $wg->done();
+                }
+            });
+        }
+
+        // 等待所有协程完成（最多30秒）
+        $wg->wait(30);
+
+        $task->finish("OK: Batch downloaded (coroutine)");
+    }
+
+    /**
+     * 下载单个metadata（无task对象，用于批量模式）
+     * @param string $ip
+     * @param int $port
+     * @param string $infohash 已解码的infohash
+     * @return bool 是否成功
+     */
+    private static function downloadSingle($ip, $port, $infohash)
+    {
+        global $config;
+
+        $sock_type = Base::is_ipv6($ip) ? SWOOLE_SOCK_TCP6 : SWOOLE_SOCK_TCP;
+        $client = new Swoole\Coroutine\Client($sock_type);
+        $client->set(array(
+            'open_eof_check' => false,
+            'package_max_length' => 1024 * 1024,
+            'connect_timeout' => 0.5,
+            'timeout' => 1,
+        ));
+
+        if (!@$client->connect($ip, $port, 0.5)) {
+            return false;
+        }
+
+        try {
+            $rs = Metadata::download_metadata($client, $infohash);
+            if ($rs !== false && is_array($rs)) {
+                DhtServer::send_response($rs, array($config['application']['server_ip'] ?? '127.0.0.1', $config['application']['server_port'] ?? 6882));
+                return true;
+            }
+            return false;
+        } catch (Throwable $e) {
+            error_log('Single download error: ' . $e->getMessage());
+            return false;
+        } finally {
+            $client->close(true);
+        }
+    }
+
+    /**
+     * 转发单个下载请求（无task对象，用于批量模式）
+     * @param string $ip
+     * @param int $port
+     * @param string $infohash_raw 原始infohash
+     */
+    private static function forwardSingleDownload($ip, $port, $infohash_raw)
+    {
+        global $config;
+
+        $download_server_ip = $config['application']['download_server_ip'] ?? '127.0.0.1';
+        $download_server_port = $config['application']['download_server_port'] ?? 6882;
+
+        $forward_msg = array(
+            'type' => 'download_metadata',
+            'ip' => $ip,
+            'port' => $port,
+            'infohash' => $infohash_raw
+        );
+
+        DhtServer::send_response($forward_msg, array($download_server_ip, $download_server_port));
+    }
+
+    /**
+     * 添加下载任务到攒批缓冲区
+     * @param Swoole\Server $serv
+     * @param string $ip
+     * @param int $port
+     * @param string $infohash
+     */
+    public static function enqueueDownload($serv, $ip, $port, $infohash)
+    {
+        global $config;
+
+        $use_coroutine = $config['application']['use_coroutine_client'] ?? true;
+        $concurrency = intval($config['application']['coroutine_concurrency'] ?? 5);
+
+        // 非协程模式或并发数为1，直接投递单任务（兼容旧行为）
+        if (!$use_coroutine || $concurrency <= 1) {
+            return $serv->task(array(
+                'type' => 'local_download_metadata',
+                'ip' => $ip,
+                'port' => $port,
+                'infohash' => $infohash
+            ));
+        }
+
+        // 协程并发模式：攒批投递
+        self::$pendingDownloads[] = [
+            'ip' => $ip,
+            'port' => $port,
+            'infohash' => $infohash
+        ];
+
+        // 攒够一批就投递
+        if (count(self::$pendingDownloads) >= $concurrency) {
+            $batch = self::$pendingDownloads;
+            self::$pendingDownloads = [];
+            return $serv->task([
+                'type' => 'batch_download_metadata',
+                'items' => $batch
+            ]);
+        }
+
+        // 启动延迟投递定时器（首次入队时启动，100ms后强制投递）
+        if (self::$batchTimerId === null) {
+            self::$batchTimerId = swoole_timer_tick(100, function ($timer_id) use ($serv) {
+                if (!empty(self::$pendingDownloads)) {
+                    $batch = self::$pendingDownloads;
+                    self::$pendingDownloads = [];
+                    $serv->task([
+                        'type' => 'batch_download_metadata',
+                        'items' => $batch
+                    ]);
+                }
+                // 无论是否有数据都清除定时器，下次入队时重新启动
+                swoole_timer_clear($timer_id);
+                self::$batchTimerId = null;
+            });
+        }
+
+        return 0;
     }
 
     /**
