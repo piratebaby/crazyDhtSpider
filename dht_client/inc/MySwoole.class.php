@@ -81,8 +81,10 @@ class MySwoole
                     foreach ($nodes as $key => $node) {
                         // 处理关联数组格式的节点数据
                         if (isset($node['nid'], $node['ip'], $node['port'])) {
-                            $table->set($node['nid'], [
-                                'nid' => $node['nid'],
+                            // 将十六进制nid转回二进制（兼容旧的二进制格式）
+                            $nid_bin = self::nidToBinary($node['nid']);
+                            $table->set($nid_bin, [
+                                'nid' => $nid_bin,
                                 'ip' => $node['ip'],
                                 'port' => $node['port'],
                                 'last_seen' => $node['last_seen'] ?? time()
@@ -91,7 +93,7 @@ class MySwoole
                             $ip_port_key = Base::is_ipv6($node['ip']) 
                                 ? '[' . $node['ip'] . ']:' . $node['port'] 
                                 : $node['ip'] . ':' . $node['port'];
-                            $ip_port_index->set($ip_port_key, ['nid' => $node['nid']]);
+                            $ip_port_index->set($ip_port_key, ['nid' => $nid_bin]);
                         }
                     }
                 }
@@ -1078,8 +1080,10 @@ class MySwoole
         if ($table instanceof Swoole\Table) {
             foreach ($table as $key => $node) {
                 if (isset($node['nid'], $node['ip'], $node['port'])) {
-                    $nodes[$key] = array(
-                        'nid' => $node['nid'],
+                    // 将二进制nid转为十六进制字符串，避免json_encode失败
+                    $nid_hex = bin2hex($node['nid']);
+                    $nodes[$nid_hex] = array(
+                        'nid' => $nid_hex,
                         'ip' => $node['ip'],
                         'port' => $node['port'],
                         'last_seen' => $node['last_seen'] ?? time()
@@ -1087,10 +1091,11 @@ class MySwoole
                 }
             }
         } else {
-            foreach ($table as $key => $node) {
+            foreach ($table as $node) {
                 if ($node instanceof Node && isset($node->nid, $node->ip, $node->port)) {
-                    $nodes[$node->nid] = array(
-                        'nid' => $node->nid,
+                    $nid_hex = bin2hex($node->nid);
+                    $nodes[$nid_hex] = array(
+                        'nid' => $nid_hex,
                         'ip' => $node->ip,
                         'port' => $node->port,
                         'last_seen' => time()
@@ -1181,6 +1186,37 @@ class MySwoole
     }
 
     /**
+     * 将nid转换为二进制格式
+     * 兼容处理：支持十六进制字符串（40字符）和二进制字符串（20字节）
+     * @param string $nid 十六进制或二进制的nid
+     * @return string 20字节二进制nid
+     */
+    private static function nidToBinary($nid)
+    {
+        if (strlen($nid) === 40 && ctype_xdigit($nid)) {
+            return hex2bin($nid);
+        }
+        return $nid;
+    }
+
+    /**
+     * 将nid转换为十六进制格式
+     * 兼容处理：支持二进制字符串（20字节）和已经是十六进制的字符串
+     * @param string $nid 二进制或十六进制的nid
+     * @return string 40字符十六进制nid
+     */
+    private static function nidToHex($nid)
+    {
+        if (strlen($nid) === 20) {
+            return bin2hex($nid);
+        }
+        if (strlen($nid) === 40 && ctype_xdigit($nid)) {
+            return $nid;
+        }
+        return bin2hex($nid);
+    }
+
+    /**
      * 从dat文件加载路由表
      * @param string $file_path 文件路径
      * @return array 路由表节点数组
@@ -1203,15 +1239,25 @@ class MySwoole
             
             // 兼容旧格式（如果是serialize格式，尝试转换为JSON）
             if (strpos($json_data, 'a:') === 0 || strpos($json_data, 'O:') === 0) {
-                // 旧的serialize格式，先反序列化再转换为JSON
+                // 旧的serialize格式，先反序列化再转换nid为十六进制
                 $old_nodes = @unserialize($json_data);
                 if ($old_nodes !== false && is_array($old_nodes)) {
-                    // 转换为JSON格式并保存
-                    $new_json_data = json_encode($old_nodes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                    // 将二进制nid转为十六进制
+                    $converted_nodes = [];
+                    foreach ($old_nodes as $key => $node) {
+                        $nid_hex = isset($node['nid']) ? self::nidToHex($node['nid']) : bin2hex($key);
+                        $converted_nodes[$nid_hex] = array(
+                            'nid' => $nid_hex,
+                            'ip' => $node['ip'] ?? '',
+                            'port' => $node['port'] ?? 0,
+                            'last_seen' => $node['last_seen'] ?? time()
+                        );
+                    }
+                    $new_json_data = json_encode($converted_nodes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
                     if ($new_json_data !== false) {
                         file_put_contents($file_path, $new_json_data);
                     }
-                    return $old_nodes;
+                    return $converted_nodes;
                 }
                 return array();
             }
