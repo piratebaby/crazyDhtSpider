@@ -13,6 +13,9 @@ class Metadata
     public static $BT_MSG_ID = 20;
     public static $EXT_HANDSHAKE_ID = 0;
     public static $PIECE_LENGTH = 16384;
+    public static $MAX_METADATA_SIZE = 16777216;  // 16MB，允许下载更大的metadata
+    public static $MAX_PIECES = 1024;              // 最大piece数量
+    public static $PIECE_MAX_RETRIES = 2;          // 每个piece最大重试次数
 
     /** @var string 实例级读缓冲区（协程模式使用，每个下载任务独立） */
     private $buffer = '';
@@ -86,20 +89,25 @@ class Metadata
                 return false;
             }
 
-            // 安全限制
-            if ($metadata_size > self::$PIECE_LENGTH * 256 || $metadata_size < 10) {
+            // 安全限制：支持最大16MB的metadata
+            if ($metadata_size > self::$MAX_METADATA_SIZE || $metadata_size < 10) {
                 return false;
             }
 
             $piecesNum = ceil($metadata_size / self::$PIECE_LENGTH);
-            if ($piecesNum > 256) {
+            if ($piecesNum > self::$MAX_PIECES) {
                 return false;
             }
 
-            // 4. 滑动窗口请求元数据
+            // 动态超时：基础10秒 + 每100KB加1秒，上限120秒
+            $total_timeout = min(120, max(30, 10 + intval($metadata_size / 102400)));
+
+            // 4. 滑动窗口请求元数据（大metadata使用更大窗口）
+            $window_size = $piecesNum > 128 ? 16 : 8;
             $received_pieces = [];
+            $piece_retries = [];    // 记录每个piece的重试次数
+            $requested_pieces = []; // 记录已请求但未响应的piece
             $next_piece = 0;
-            $window_size = 8;
             $inflight = 0;
 
             // 初始填充窗口
@@ -107,9 +115,14 @@ class Metadata
                 if (!$this->request_metadata($client, $ut_metadata, $next_piece)) {
                     return false;
                 }
+                $requested_pieces[$next_piece] = true;
                 $next_piece++;
                 $inflight++;
             }
+
+            // 记录上一次收到piece的时间，用于检测超时重试
+            $last_recv_time = microtime(true);
+            $retry_timeout = 5.0; // 单个piece超时5秒后重试
 
             while (count($received_pieces) < $piecesNum) {
                 if (microtime(true) - $start_time > $total_timeout) {
@@ -118,8 +131,15 @@ class Metadata
 
                 $packet = $this->recvall($client);
                 if ($packet === false) {
-                    return false;
+                    // 接收失败，尝试重试未完成的piece
+                    if (!$this->retryMissingPieces($client, $ut_metadata, $piecesNum, $received_pieces, $piece_retries, $requested_pieces)) {
+                        return false;
+                    }
+                    $last_recv_time = microtime(true);
+                    continue;
                 }
+
+                $last_recv_time = microtime(true);
 
                 while (strlen($packet) > 0) {
                     $piece_result = $this->parse_metadata_piece($packet);
@@ -131,20 +151,30 @@ class Metadata
                         $piece_index = $piece_result['piece'];
                         if (!isset($received_pieces[$piece_index]) && $piece_index < $piecesNum) {
                             $received_pieces[$piece_index] = $piece_result['data'];
+                            unset($requested_pieces[$piece_index]);
                             $inflight--;
                             while ($next_piece < $piecesNum && $inflight < $window_size) {
                                 if (!$this->request_metadata($client, $ut_metadata, $next_piece)) {
                                     return false;
                                 }
+                                $requested_pieces[$next_piece] = true;
                                 $next_piece++;
                                 $inflight++;
                             }
                         }
                     } elseif ($piece_result['msg_type'] == 2) {
-                        return false;
+                        // peer拒绝，不直接放弃，继续尝试其他piece
                     }
 
                     $packet = $piece_result['remaining'];
+                }
+
+                // 检查是否有超时未响应的piece需要重试
+                if (microtime(true) - $last_recv_time > $retry_timeout && $inflight > 0) {
+                    if (!$this->retryMissingPieces($client, $ut_metadata, $piecesNum, $received_pieces, $piece_retries, $requested_pieces)) {
+                        return false;
+                    }
+                    $last_recv_time = microtime(true);
                 }
             }
 
@@ -185,6 +215,37 @@ class Metadata
         }
 
         return $result;
+    }
+
+    /**
+     * 重试缺失的piece
+     * @param mixed $client 客户端连接
+     * @param int $ut_metadata 扩展消息ID
+     * @param int $piecesNum 总piece数
+     * @param array $received_pieces 已接收的piece
+     * @param array $piece_retries piece重试计数
+     * @param array $requested_pieces 已请求但未响应的piece
+     * @return bool 是否还有可重试的piece
+     */
+    private function retryMissingPieces($client, $ut_metadata, $piecesNum, &$received_pieces, &$piece_retries, &$requested_pieces)
+    {
+        $retried = false;
+        for ($i = 0; $i < $piecesNum; $i++) {
+            if (isset($received_pieces[$i])) {
+                continue;
+            }
+            $retries = isset($piece_retries[$i]) ? $piece_retries[$i] : 0;
+            if ($retries >= self::$PIECE_MAX_RETRIES) {
+                // 超过最大重试次数，放弃整个下载
+                return false;
+            }
+            $piece_retries[$i] = $retries + 1;
+            if ($this->request_metadata($client, $ut_metadata, $i)) {
+                $requested_pieces[$i] = true;
+                $retried = true;
+            }
+        }
+        return $retried || count($received_pieces) < $piecesNum;
     }
 
     /**
