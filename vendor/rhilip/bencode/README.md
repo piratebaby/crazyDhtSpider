@@ -8,8 +8,8 @@
 
 This is a pure PHP library that allows you to encode and decode Bencode data, with torrent file parse and vaildate.
 
-This library is fork from [OPSnet/bencode-torrent](https://github.com/OPSnet/bencode-torrent),
-with same method like [sandfoxme/bencode](https://github.com/arokettu/bencode), [sandfoxme/torrent-file](https://github.com/arokettu/torrent-file)
+This library is forked from [OPSnet/bencode-torrent](https://github.com/OPSnet/bencode-torrent),
+with almost same methods like [arokettu/bencode](https://github.com/arokettu/bencode), [arokettu/torrent-file](https://github.com/arokettu/torrent-file)
 
 ## Installation
 
@@ -118,7 +118,11 @@ $creationDate = $torrent->getCreationDate();
 $torrent->setHttpSeeds(['udp://example.com/seed']);
 $httpSeeds = $torrent->getHttpSeeds();
 
-$torrent->setNodes(['udp://example.com/seed']);
+$torrent->setNodes([
+    ['127.0.0.1', 6881],
+    ['your.router.node', 4804],
+    ['2001:db8:100:0:d5c8:db3f:995e:c0f7', 1941],
+]);
 $nodes = $torrent->getNodes();
 
 $torrent->setUrlList(['udp://example.com/seed']);
@@ -199,7 +203,6 @@ $count = $torrent->getFileCount();
  */
 $fileList = $torrent->getFileList();
 
-
 /**
  * Return a dict like:
  * [
@@ -211,8 +214,9 @@ $fileList = $torrent->getFileList();
  *    ]
  * ]
  *
- * > Add in v2.4.0
- * You can now pass argument to control the fileTree sort type. By default, this argument is TorrentFile::FILETREE_SORT_NORMAL.
+ * @since v2.4.0 You can now pass argument to control the fileTree sort type. 
+ *               By default, this argument is TorrentFile::FILETREE_SORT_NORMAL.
+ * 
  * Control Const (see different in `tests/TorrentFileTreeSortTest.php` file):
  *  - TorrentFile::FILETREE_SORT_NORMAL : not sort, also means sort by torrent file parsed order 
  *  - TorrentFile::FILETREE_SORT_STRING : sort by filename ASC ("natural ordering" and "case-insensitively")
@@ -222,7 +226,23 @@ $fileList = $torrent->getFileList();
  */
 $fileTree = $torrent->getFileTree(?$sortType = TorrentFile::FILETREE_SORT_NORMAL);
 
-// 6. Other method
+// 6. unhybridized
+/**
+ * Create an unhybridized copy of a hybrid torrent for the specified single protocol version
+ * (does not modify the original instance).
+ *
+ * This method returns a clone of the current object and removes metadata fields from the clone
+ * that are incompatible with the target version to produce an "unhybridized" torrent.
+ * For example:
+ *  when the target is `TorrentFile::PROTOCOL_V1`, v2 fields are removed;
+ *  when the target is `TorrentFile::PROTOCOL_V2`, v1 fields are removed.
+ * 
+ * @since v2.5.0
+ */
+$v1ProtocolOnlyTorrent = $hybridTorrent->unhybridizedTo(TorrentFile::PROTOCOL_V1);
+$v2ProtocolOnlyTorrent = $hybridTorrent->unhybridizedTo(TorrentFile::PROTOCOL_V2);
+
+// 7. Other method
 $torrent->cleanCache();
 
 // Note 1: clean,set,unset method are chaining

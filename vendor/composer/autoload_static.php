@@ -11,20 +11,12 @@ class ComposerStaticInite1394b437954dbc3155ea0fec8062bc4
         array (
             'Rhilip\\Bencode\\' => 15,
         ),
-        'M' =>
-        array (
-            'Medoo\\' => 6,
-        ),
     );
 
     public static $prefixDirsPsr4 = array (
         'Rhilip\\Bencode\\' =>
         array (
             0 => __DIR__ . '/..' . '/rhilip/bencode/src',
-        ),
-        'Medoo\\' =>
-        array (
-            0 => __DIR__ . '/..' . '/catfan/medoo/src',
         ),
     );
 

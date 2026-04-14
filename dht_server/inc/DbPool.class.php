@@ -89,8 +89,9 @@ class DbPool
 
     /**
      * 核心分析逻辑：计算资源分类与主体后缀
+     * public 以便离线脚本 tools/torrent_indices.php 复用，避免代码分叉
      */
-    private static function analyzeTorrent($name, $filesJson): array
+    public static function analyzeTorrent($name, $filesJson): array
     {
         $extToCategory = [
             'mp4'=>'Video', 'mkv'=>'Video', 'avi'=>'Video', 'rmvb'=>'Video', 'ts'=>'Video', 'mov'=>'Video', 'wmv'=>'Video', 'flv'=>'Video',
@@ -130,8 +131,15 @@ class DbPool
         }
 
         arsort($extSizeMap);
-        $primaryExt = array_key_first($extSizeMap);
+        $primaryExt = (string)array_key_first($extSizeMap);
+        // 清洗后缀：只保留字母和数字，避免非UTF-8字符写入数据库报错
+        $primaryExt = preg_replace('/[^a-zA-Z0-9]/', '', $primaryExt);
         $primaryExt = substr($primaryExt, 0, 30);
+
+        if (empty($primaryExt)) {
+            return ['ext' => 'unknown', 'cat' => 'Other', 'count' => $count];
+        }
+
         $category = $extToCategory[$primaryExt] ?? 'Other';
 
         return ['ext' => $primaryExt, 'cat' => $category, 'count' => $count];

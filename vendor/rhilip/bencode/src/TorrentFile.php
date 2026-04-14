@@ -15,6 +15,19 @@ if (!function_exists('str_contains')) {
     }
 }
 
+if (!function_exists('array_last')) {
+    /**
+     * polyfill of array_last for PHP < 8.5.0
+     *
+     * @param array $array
+     * @return false|mixed|null
+     */
+    function array_last(array $array)
+    {
+        return $array ? current(array_slice($array, -1)) : null;
+    }
+}
+
 /**
  * Additionally, as this is for torrent files, we can make the following assumptions
  * and requirements:
@@ -569,7 +582,7 @@ class TorrentFile
     protected function addFileToList($paths, $size)
     {
         if ($this->useParseValidator) {
-            call_user_func($this->parseValidator, self::arrayEnd($paths), $paths);
+            call_user_func($this->parseValidator, array_last($paths), $paths);
         }
         $this->cache['files'][] = ['path' => implode('/', $paths), 'size' => $size];
     }
@@ -755,6 +768,15 @@ class TorrentFile
      *         "filename1" => 123  //  123 is file size
      *    ]
      * ]
+     *
+     * @since v2.4.0 You can now pass argument to control the fileTree sort type.
+     *               By default, this argument is TorrentFile::FILETREE_SORT_NORMAL.
+     *
+     * Control Const (see different in `tests/TorrentFileTreeSortTest.php` file):
+     *  - TorrentFile::FILETREE_SORT_NORMAL : not sort, also means sort by torrent file parsed order
+     *  - TorrentFile::FILETREE_SORT_STRING : sort by filename ASC ("natural ordering" and "case-insensitively")
+     *  - TorrentFile::FILETREE_SORT_FOLDER : sort by filetype (first folder, then file)
+     *  - TorrentFile::FILETREE_SORT_NATURAL: sort by both filetype and filename ( same as `TorrentFile::FILETREE_SORT_STRING | TorrentFile::FILETREE_SORT_FOLDER` )
      */
     public function getFileTree($sortType = self::FILETREE_SORT_NORMAL)
     {
@@ -773,15 +795,57 @@ class TorrentFile
         return $fileTree;
     }
 
+    /**
+     * Create an unhybridized copy of a hybrid torrent for the specified single protocol version
+     * (does not modify the original instance).
+     *
+     * This method returns a clone of the current object and removes metadata fields from the clone
+     * that are incompatible with the target version to produce an "unhybridized" torrent.
+     * For example:
+     *  when the target is `TorrentFile::PROTOCOL_V1`, v2 fields are removed;
+     *  when the target is `TorrentFile::PROTOCOL_V2`, v1 fields are removed.
+     *
+     * @param string $targetProtocol Target protocol version, use class constants `TorrentFile::PROTOCOL_V1`
+     *                               or `TorrentFile::PROTOCOL_V2`. Defaults to `TorrentFile::PROTOCOL_V1`.
+     * @return TorrentFile The cloned `TorrentFile` instance converted to the target version.
+     * @throws ParseException If the current torrent is not hybrid or an unknown `$targetVersion` is provided.
+     * @since v2.5.0
+     */
+    public function unhybridizedTo($targetProtocol = self::PROTOCOL_V1)
+    {
+        $currentProtocol = $this->getProtocol();
+        if ($currentProtocol !== self::PROTOCOL_HYBRID && $currentProtocol !== $targetProtocol) {
+            throw new ParseException("Unable to unhybridized, this torrent is {$currentProtocol}-only and can't convert to {$targetProtocol}.");
+        }
+
+        $unhybridizedTorrent = clone $this;
+        unset($unhybridizedTorrent->cache['protocol']);  // clean protocol cache if exist
+        if ($targetProtocol == self::PROTOCOL_HYBRID) {
+            // Nothing need to do when hybrid torrent unhybridized to hybrid
+        } elseif ($targetProtocol == self::PROTOCOL_V1) {
+            // Remove Bittorrent v2 field
+            $unhybridizedTorrent
+                ->unsetRootField('piece layers')
+                ->unsetInfoField('meta version')
+                ->unsetInfoField('file tree');
+        } elseif ($targetProtocol == self::PROTOCOL_V2) {
+            // Remove Bittorrent v1 field
+            $unhybridizedTorrent
+                ->unsetInfoField('pieces')
+                ->unsetInfoField('files')
+                ->unsetInfoField('length')
+                ->unsetInfoField('attr')
+                ->unsetInfoField('sha1');
+        } else {
+            throw new ParseException('Unknown unhybridized target.');
+        }
+
+        return $unhybridizedTorrent;
+    }
+
     public function cleanCache()
     {
         $this->cache = [];
         return $this;
-    }
-
-    // Wrapper end function to avoid change the internal pointer of $path,
-    private static function arrayEnd($array)
-    {
-        return end($array);
     }
 }

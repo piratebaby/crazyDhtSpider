@@ -47,17 +47,6 @@ class Func
         return $filesize;
     }
 
-    public static function characet($data)
-    {
-        if (!empty($data)) {
-            $fileType = mb_detect_encoding($data, array('UTF-8', 'GBK', 'LATIN1', 'BIG5'));
-            if ($fileType != 'UTF-8') {
-                $data = mb_convert_encoding($data, 'utf-8', $fileType);
-            }
-        }
-        return $data;
-    }
-
     public static function getKeyWords($title)
     {
         if ($title == '') {
@@ -77,16 +66,6 @@ class Func
             }
         }
         return implode(',', $title);
-    }
-
-    public static function strToUtf8($str)
-    {
-        $encode = mb_detect_encoding($str, array("ASCII", 'UTF-8', "GB2312", "GBK", 'BIG5'));
-        if ($encode == 'UTF-8') {
-            return $str;
-        } else {
-            return mb_convert_encoding($str, 'UTF-8', $encode);
-        }
     }
 
     public static function array_transcoding($array)

@@ -38,7 +38,7 @@ class MySwoole
         }
 
         try {
-            $rs = Base::decode($data);
+            $rs = Bencode::decode($data);
             if (!is_array($rs) || !isset($rs['infohash'])) {
                 return false;
             }
@@ -71,10 +71,6 @@ class MySwoole
         return true;
     }
 
-    public static function task(Swoole\Server $serv, Swoole\Server\Task $task)
-    {
-    }
-
     public static function workerExit($serv, $worker_id)
     {
         Swoole\Timer::clearAll();
@@ -83,9 +79,5 @@ class MySwoole
 
         gc_mem_caches();
         gc_collect_cycles();
-    }
-
-    public static function finish($serv, $task_id, $data)
-    {
     }
 }
